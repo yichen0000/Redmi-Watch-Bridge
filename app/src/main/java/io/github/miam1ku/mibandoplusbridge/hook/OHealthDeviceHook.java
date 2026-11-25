@@ -1986,6 +1986,34 @@ public final class OHealthDeviceHook {
     private static long absentSinceMs;
 
     /**
+     * While the bridge card is yielded, Health's snapshot observer is not guaranteed to run again
+     * (it only re-fires on a bridge-provider data change). A card deleted from Health's own device
+     * space while the bridge data stays put would otherwise leave yield=true forever, and the band
+     * disappears from device space entirely. This watch re-evaluates on a fixed cadence so the
+     * bridge card comes back once Health's row is gone.
+     */
+    private static final long YIELD_WATCH_MS = 30_000L;
+    private static final Runnable[] yieldWatch = new Runnable[1];
+
+    /**
+     * Health 6.11 keeps answering "this band is listed" from WatchProvider even though its own
+     * device-space table (device_info_table_new) is empty, and device space renders no row for it.
+     * Yielding there hides the only card, so the band disappears from device space entirely.
+     * Below this version the yielded row does render, so the duplicate guard still applies.
+     */
+    private static final long HEALTH_DEVICE_SPACE_ROW_LOST = 6110000L;
+
+    /** False once Health stopped rendering its own device-space row for this band. */
+    private static boolean yieldAllowed() {
+        try {
+            return hostContext.getPackageManager().getPackageInfo(HOST, 0).getLongVersionCode()
+                    < HEALTH_DEVICE_SPACE_ROW_LOST;
+        } catch (Throwable unavailable) {
+            return true;
+        }
+    }
+
+    /**
      * Hide the bridge card only while health's own device-space row is still there.
      * Only the main process decides. Health's other processes and a provider that is still
      * starting see no row for a moment, and each of those used to bring the second card back.
@@ -1994,6 +2022,12 @@ public final class OHealthDeviceHook {
         Bundle shown = snapshot;
         if (shown == null || hostContext == null) return;
         if (!"com.heytap.health".equals(android.app.Application.getProcessName())) return;
+        if (!yieldAllowed()) {
+            // Health reports the band as listed but device space shows no row for it. Keep the
+            // bridge card visible and clear any yield a previous Health build left behind.
+            releaseYield(loader);
+            return;
+        }
         boolean registered = shown.getBoolean("registered", false);
         String mac = shown.getString("mac", "");
         Boolean found = registered && !mac.isBlank() ? healthCardPresent(mac) : Boolean.FALSE;
@@ -2019,6 +2053,16 @@ public final class OHealthDeviceHook {
                 }
             }
         }
+        // While yielded (present), keep re-checking on a fixed cadence: Health's snapshot observer
+        // only re-fires on a bridge-provider data change, so a Health-side card removal that leaves
+        // the bridge data untouched would otherwise never be noticed and yield stays true forever.
+        if (present) {
+            scheduleYieldWatch(loader);
+        } else if (yieldWatch[0] != null) {
+            Handler handler = worker;
+            if (handler != null) handler.removeCallbacks(yieldWatch[0]);
+            yieldWatch[0] = null;
+        }
         if (yielded != null && yielded == present) return;
         // While Health's row is listed, the bridge card steps aside so the band shows once.
         // When that row goes away, the bridge card comes back and keeps the band in device space.
@@ -2028,6 +2072,41 @@ public final class OHealthDeviceHook {
             extras.putBoolean("yield", present);
             hostContext.getContentResolver().call(DeviceCardProvider.URI, "spaceYield", null, extras);
             HookRuntime.log(present ? "DEVICE_SPACE_YIELD" : "DEVICE_SPACE_RESTORE");
+        } catch (Throwable failure) {
+            HookRuntime.log("DEVICE_SPACE_YIELD_UNAVAILABLE "
+                    + failure.getClass().getSimpleName());
+        }
+    }
+
+    /** Self-scheduling re-evaluation while the bridge card is yielded. */
+    private static void scheduleYieldWatch(ClassLoader loader) {
+        Handler handler = worker;
+        if (handler == null) return;
+        if (yieldWatch[0] != null) handler.removeCallbacks(yieldWatch[0]);
+        yieldWatch[0] = () -> {
+            yieldWatch[0] = null;
+            dropDuplicateSpaceCard(loader);
+        };
+        handler.postDelayed(yieldWatch[0], YIELD_WATCH_MS);
+    }
+
+    /**
+     * Health answered with a row that device space does not render. Clear the yield once so the
+     * bridge card takes over, and stop the duplicate-card watch.
+     */
+    private static void releaseYield(ClassLoader loader) {
+        if (yieldWatch[0] != null) {
+            Handler handler = worker;
+            if (handler != null) handler.removeCallbacks(yieldWatch[0]);
+            yieldWatch[0] = null;
+        }
+        if (Boolean.FALSE.equals(yielded)) return;
+        yielded = Boolean.FALSE;
+        try {
+            Bundle extras = new Bundle();
+            extras.putBoolean("yield", false);
+            hostContext.getContentResolver().call(DeviceCardProvider.URI, "spaceYield", null, extras);
+            HookRuntime.log("DEVICE_SPACE_RESTORE_NO_ROW");
         } catch (Throwable failure) {
             HookRuntime.log("DEVICE_SPACE_YIELD_UNAVAILABLE "
                     + failure.getClass().getSimpleName());
