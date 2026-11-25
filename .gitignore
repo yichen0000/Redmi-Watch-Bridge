@@ -1,0 +1,17 @@
+.gradle/
+**/build/
+local.properties
+*.jks
+*.keystore
+*.apk
+vendor/
+dist/
+analysis/
+HANDOFF.md
+.idea/
+*.iml
+__pycache__/
+*.pyc
+tools/
+docs/ADAPT_PLAN.md
+docs/

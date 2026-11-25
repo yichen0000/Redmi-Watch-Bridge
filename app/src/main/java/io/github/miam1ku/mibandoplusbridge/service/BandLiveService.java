@@ -1,0 +1,2745 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+package io.github.miam1ku.mibandoplusbridge.service;
+
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.Service;
+import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothDevice;
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.pm.ServiceInfo;
+import android.os.IBinder;
+import io.github.miam1ku.mibandoplusbridge.data.BandStateRepository;
+import io.github.miam1ku.mibandoplusbridge.protocol.SppDiagnosticClient;
+import java.io.File;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+
+/** Keeps one authenticated SPP session for the whole NATIVE ownership period and reconnects after the link drops. */
+public final class BandLiveService extends Service {
+    private static final String ACTION_SYNC = "io.github.miam1ku.mibandoplusbridge.SYNC";
+    private static final String ACTION_REPAIR = "io.github.miam1ku.mibandoplusbridge.REPAIR";
+    private static final long PENDING_MANUAL_SYNC_TTL_MS = 30_000L;
+    private static final long MANUAL_SYNC_OVERRIDE_TTL_MS = 60_000L;
+    private static volatile BandLiveService instance;
+    private static volatile long pendingManualSyncAtMs;
+    private static volatile io.github.miam1ku.mibandoplusbridge.protocol.XiaomiMassReceive deviceLogReceiver;
+    private static volatile boolean diagnosticPaused;
+    private volatile java.util.concurrent.CountDownLatch stopped = new java.util.concurrent.CountDownLatch(0);
+    private final java.util.concurrent.CountDownLatch destroyed = new java.util.concurrent.CountDownLatch(1);
+    private final java.util.concurrent.ScheduledExecutorService coordinator =
+            Executors.newSingleThreadScheduledExecutor(r -> new Thread(r, "OplusBandCoordinator"));
+    private volatile io.github.miam1ku.mibandoplusbridge.protocol.LiveCommandQueue commands;
+    private LiveHistorySync historySync;
+    private volatile boolean syncRequested;
+    private final AtomicBoolean manualSyncRequested = new AtomicBoolean();
+    private volatile long manualSyncRequestedAtMs;
+    private volatile boolean realtimeStatsStopPending;
+    /** Last sign of life from the supervisor. ColorOS freezing the process, or a dead worker
+     *  thread, used to leave the service foreground on 「正在连接手环」 for hours with no retry. */
+    private volatile long supervisorBeatMs;
+    private static final long SUPERVISOR_STALL_MS = 180_000L;
+    private long nextBatteryAt;
+    private long nextHealthAt;
+    private long nextWeatherAt;
+    /** Daytime idle cadence. Night history requests are deliberately much less frequent. */
+    private static final long IDLE_POLL_MINUTES = 30;
+    private static final long NIGHT_POLL_MINUTES = 120;
+    private static final int NIGHT_START_HOUR = 22;
+    private static final int NIGHT_END_HOUR = 8;
+    private static final int NIGHT_HARD_END_HOUR = 14;
+    private static final long QUIET_STEPS_MINUTES = 60;
+    private static final long QUIET_SAMPLE_MAX_AGE_MINUTES = 90;
+    private static final long QUIET_WAKE_STEPS = 30;
+    private static final long NIGHT_STATS_REFRESH_MINUTES = 60;
+    private static final int AWAKE_CONFIRM_SAMPLES = 2;
+    private static final int SLEEP_STATE_MISS_LIMIT = 2;
+    /** A band sleep report older than this is re-asked before any history request. */
+    private static final long SLEEP_STATE_FRESH_MINUTES = 5;
+    /** Second AWAKE sample during the late hold; the first is often minutes after waking. */
+    private static final long LATE_AWAKE_CONFIRM_SECONDS = 60;
+    private static final long DAY_ASLEEP_DEFER_HOURS = 3;
+    private static final long NIGHT_RESTART_COOLDOWN_MINUTES = 60;
+    private static final String LIVE_PREFS = "live-service";
+    private static final String LAST_NIGHT_FLUSH = "lastNightFlushAtMs";
+    private static final String WAKE_CATCHUP_DATE = "wakeCatchupDate";
+    /**
+     * The band reports the level itself and only pushes a change when its own counter moves, so
+     * the phone copy is whatever the last request returned. The idle session is already up, and
+     * one 4-byte request costs no extra link, so ask more often than the file list.
+     */
+    private static final long BATTERY_POLL_MINUTES = 10;
+    /**
+     * Sleep is tracked independently from the music feature. History file lists close the band's
+     * open sleep file, so that request must never run until the band is known to be awake.
+     */
+    private static final long SLEEP_STATE_POLL_MINUTES = 5;
+    private static final long INITIAL_HISTORY_SYNC_WAIT_SECONDS = 20;
+    private static final long REALTIME_STATS_TIMEOUT_SECONDS = 30;
+    /** 8/45 opens the band's live-stats stream. The band measures heart rate while that stream runs, so only the first snapshot is kept. */
+    private static final int REALTIME_STATS_START = 45;
+    /** 8/46 stops the live stream after the first snapshot. */
+    private static final int REALTIME_STATS_STOP = 46;
+    private WeatherSync weatherSync;
+    private HealthReplay healthReplay;
+    private volatile long sessionEpoch;
+    private static final java.util.concurrent.atomic.AtomicLong SESSION_IDS = new java.util.concurrent.atomic.AtomicLong();
+    private io.github.miam1ku.mibandoplusbridge.notify.PhoneCallMonitor calls;
+    private static final String HEALTH_PACKAGE = "com.heytap.health";
+    private static final android.content.ComponentName HEALTH_SERVICE = new android.content.ComponentName(
+            HEALTH_PACKAGE, "com.heytap.health.rpc.host.HealthRpcMsgService");
+    private final android.os.Handler main = new android.os.Handler(android.os.Looper.getMainLooper());
+    private volatile boolean healthBound;
+    private final android.content.ServiceConnection healthConnection = new android.content.ServiceConnection() {
+        @Override public void onServiceConnected(android.content.ComponentName name, IBinder binder) {
+            healthHostStatus("READY");
+        }
+        @Override public void onServiceDisconnected(android.content.ComponentName name) {
+            healthHostStatus("UNAVAILABLE");
+        }
+        @Override public void onBindingDied(android.content.ComponentName name) {
+            unbindHealthHost();
+            healthHostStatus("UNAVAILABLE");
+            reviveHealth();
+        }
+        @Override public void onNullBinding(android.content.ComponentName name) {
+            unbindHealthHost();
+            healthHostStatus("UNAVAILABLE");
+        }
+    };
+    private static final String CHANNEL = "band-live";
+    private static final io.github.miam1ku.mibandoplusbridge.notify.NotifyDedupe NOTIFICATIONS =
+            new io.github.miam1ku.mibandoplusbridge.notify.NotifyDedupe();
+    private static final io.github.miam1ku.mibandoplusbridge.notify.NotifyReplay HELD_NOTIFICATIONS =
+            new io.github.miam1ku.mibandoplusbridge.notify.NotifyReplay();
+    private final java.util.ArrayDeque<String> iconPackages = new java.util.ArrayDeque<>();
+    private final AtomicBoolean iconUploadBusy = new AtomicBoolean();
+    private volatile String iconPackage;
+    private static final int NOTICE = 7;
+    private static final long INITIAL_BACKOFF_MS = 3_000;
+    private static final long MAX_BACKOFF_MS = 30_000;
+    /** Config errors stay in this process. Exiting is what makes health launch the app. */
+    private static final long QUIET_BACKOFF_MS = 120_000;
+    /**
+     * Pace used while the peer is refusing every connect. Measured both ways: hammering at 30 s and
+     * sitting back at 120 s both wait out the whole lockout, so the probe only has to be frequent
+     * enough to catch the release. 45 s keeps the gap under the offline grace above.
+     */
+    private static final long LOCKOUT_PROBE_MS = 45_000;
+    /**
+     * How long a lost link keeps being published as connected.
+     *
+     * <p>An earlier reading of the logs called the drop a fixed five minute session limit. That was
+     * wrong: one session ran 346 s and the next 636 s, both ended by the peer with the same
+     * {@code bt socket closed, read return: -1}, and the bridge runs no timer that could close a
+     * healthy session (the 45 s handshake watchdog is cancelled before {@code holdOpen()}, queue
+     * deadlines only fail one command, the 180 s supervisor stall only restarts the loop).
+     *
+     * <p>What the peer does own is the silence that follows. Twice measured: it closes the session,
+     * then accepts an RFCOMM connect on channel 5 and drops it again within a few tens of
+     * milliseconds, and keeps doing that for about four minutes — 12:47:18 to 12:51:13, and
+     * 13:02:34 onwards. Probing every 30 s and probing every 120 s both sit through the whole
+     * window, so the wait is the peer's and cannot be shortened from here. The one thing that does
+     * line up with every refused attempt is the system's own HFP client: the phone dials the band
+     * 0.1-0.3 s after each of our RFCOMM connects and hangs up 2.3 s later, and the band answers no
+     * SPP while that handshake is in flight.
+     *
+     * <p>So the gap to hide is the whole lockout, not three seconds, and the lockout is not always
+     * four minutes: the 2026-11-24 13:02 episode was still refusing at 13:11. Publishing
+     * connected=false the moment the read fails made the host repaint 断开 for the whole of it, and
+     * OPPO Health reads the very same field, which is what the user sees as 「又自动断开了」. Ten
+     * minutes covers every lockout measured so far; a real disappearance — band out of range, band
+     * off, band reset — still surfaces, just later.
+     */
+    private static final long OFFLINE_GRACE_MS = 600_000;
+    private final ExecutorService worker = Executors.newSingleThreadExecutor(r -> {
+        Thread thread = new Thread(r, "OplusBandLive");
+        thread.setDaemon(false);
+        return thread;
+    });
+    private final AtomicBoolean running = new AtomicBoolean();
+    private final Object stopLock = new Object();
+    private volatile boolean stopRequested;
+    private volatile long lastDndSentNanos;
+    private int lastDndFilter = Integer.MIN_VALUE;
+    private long dndSyncAtNanos;
+    private final Object dndSyncLock = new Object();
+    private final Runnable dndRulesAgain = this::sendDndRulesAgain;
+    private volatile boolean dndPushPhone;
+    private volatile boolean dndBandKnown;
+    private volatile boolean dndBandOn;
+    private final java.util.concurrent.atomic.AtomicBoolean dndAdopted = new java.util.concurrent.atomic.AtomicBoolean();
+    /** The band's own 同步手机勿扰 switch. Off is the user's choice there, and it outlives a link. */
+    private final io.github.miam1ku.mibandoplusbridge.notify.BandDndSync dndSync =
+            new io.github.miam1ku.mibandoplusbridge.notify.BandDndSync();
+    private final Runnable dndAskFallback = this::dndAskTimedOut;
+    private static final String FEATURES = "features";
+    private static final String DND_SYNC_OFF_KEY = "dndSyncOff";
+    /** A band that does not answer subtype 14 still gets the mirror, just this much later. */
+    private static final long DND_ASK_FALLBACK_MS = 1_500;
+    /** Last value written to prefs, so a reply from every mirror does not hit the disk. */
+    private volatile Boolean dndSyncStored;
+    private static volatile nodomain.freeyourgadget.gadgetbridge.proto.xiaomi.XiaomiProto.Command lastMusic;
+    private final io.github.miam1ku.mibandoplusbridge.notify.SleepMusic sleepMusic =
+            new io.github.miam1ku.mibandoplusbridge.notify.SleepMusic();
+    private volatile boolean sleepPauseOn;
+    private volatile long sleepArmedAtMs = Long.MAX_VALUE;
+    private volatile Boolean bandAsleep;
+    /** Wall time of the last 2/78 or 2/79 report behind {@link #bandAsleep}. */
+    private volatile long bandAsleepAtMs;
+    /** First deferral of the pending pull; 0 when nothing is held. */
+    private volatile long historyDeferredSinceMs;
+    private volatile boolean sleepStateUnsupported;
+    private int sleepStateMisses;
+    private volatile boolean waitingForInitialSleepState;
+    private volatile boolean historySyncPending;
+    /** Last deferred verdict written to the session log; identical repeats are dropped. */
+    private volatile String lastHistoryDeferLine;
+    private volatile boolean pendingHistoryIncludesHistory;
+    private volatile long historyCooldownUntilMs;
+    private long historyStateDeadlineAt;
+    private long nextSleepStateAt;
+    private long sessionStartAtMs;
+    private volatile long lastNightFlushAtMs;
+    private int awakeSamples;
+    private long nextNightStatsAt;
+    /*
+     * The quiet tracker is owned by the single coordinator thread. volatile keeps reads safe for
+     * diagnostics while all updates remain serialized with tick(), noteSleep(), and flush.
+     */
+    private volatile boolean nightHadQuiet;
+    private long quietStepsValue = Long.MIN_VALUE;
+    private long quietSinceMs;
+    private long quietCheckedAtMs;
+    private long quietBaselineSteps = -1;
+    private long quietSampleAtMs;
+    private volatile boolean quietSignalStale;
+    private volatile boolean nightQuietResult;
+    private final NightWakeEvidence wakeEvidence = new NightWakeEvidence();
+    private long wakeEvidenceCheckedAtMs;
+    private volatile boolean retryNow;
+    /** SPP needs the system bond. This keeps the re-pair budget for one bond loss. */
+    private final BondRecovery bondRecovery = new BondRecovery();
+    /** Where the pairing budget survives a process restart. */
+    private static final String BOND_PREFS = "bond-recovery";
+    private boolean bondGaveUpLogged;
+    /** True while the notice offers the 重新配对 action after the single automatic ask. */
+    private volatile boolean bondRepairOffered;
+    /** The action on the currently posted notice, to keep the dedupe check honest. */
+    private boolean bondRepairShown;
+    private String noticeTitle = "";
+    private volatile SppDiagnosticClient client;
+    /**
+     * Publishes connected=false after the reopen window. Null while the link is up or while no
+     * check is pending. Always touched on the main thread.
+     */
+    /**
+     * Publishes connected=false after the reopen window. Null while the link is up or while no
+     * check is pending. Written on the main thread, read from the worker when a retry finishes.
+     */
+    private volatile Runnable offlineGrace;
+    private boolean receiverRegistered;
+    private boolean dndReceiverRegistered;
+    private final BroadcastReceiver bluetoothEvents = new BroadcastReceiver() {
+        @Override public void onReceive(Context context, Intent intent) {
+            if (intent == null) return;
+            if (BluetoothDevice.ACTION_BOND_STATE_CHANGED.equals(intent.getAction())) {
+                noteBond(context, intent);
+                return;
+            }
+            if (!BluetoothAdapter.ACTION_STATE_CHANGED.equals(intent.getAction())) return;
+            int state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR);
+            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(context, "bt adapter state=" + state
+                    + "/" + adapterState(state));
+            if (state == BluetoothAdapter.STATE_OFF || state == BluetoothAdapter.STATE_TURNING_OFF) {
+                SppDiagnosticClient active = client;
+                if (active != null) active.close();
+                // The system sends this broadcast. Clear the card immediately; the socket
+                // thread may still be blocked in a read when the adapter is powered off.
+                cancelOfflineGrace();
+                try { new BandStateRepository(context).markSessionClosed(); }
+                catch (RuntimeException ignored) { }
+            } else if (state == BluetoothAdapter.STATE_ON) {
+                synchronized (stopLock) {
+                    retryNow = true;
+                    stopLock.notifyAll();
+                }
+            }
+        }
+    };
+    private final BroadcastReceiver dndEvents = new BroadcastReceiver() {
+        @Override public void onReceive(Context context, Intent intent) {
+            if (NotificationManager.ACTION_INTERRUPTION_FILTER_CHANGED.equals(intent.getAction())) syncDnd();
+        }
+    };
+    private final android.database.ContentObserver zenMode = new android.database.ContentObserver(main) {
+        @Override public void onChange(boolean selfChange) { syncDnd(); }
+    };
+
+    public static void start(Context context) {
+        admit(context);
+        launch(context, false);
+    }
+
+    /** Package update runs this off the main thread and can wait for the root start. */
+    public static void startBlocking(Context context) {
+        admit(context);
+        launch(context, true);
+    }
+
+    /** Health card reads and notification IPC. Does nothing while this process already hosts the service. */
+    public static void ensureProcess(Context context) {
+        BandLiveService live = instance;
+        if (live != null && !live.stopRequested) return;
+        try {
+            start(context);
+        } catch (RuntimeException ignored) { }
+    }
+    /** True while this process hosts the service and a stop has not been requested. */
+    public static boolean isRunning() {
+        BandLiveService live = instance;
+        return live != null && !live.stopRequested;
+    }
+
+    public static boolean mayWake(Context context) {
+        if (context == null || diagnosticPaused) return false;
+        if (!context.getSystemService(android.os.UserManager.class).isUserUnlocked()) return false;
+        if (!new BandStateRepository(context).isRegistered()) return false;
+        return new OwnershipController(context).nativeReady();
+    }
+
+    private static void admit(Context context) {
+        if (diagnosticPaused) throw new IllegalStateException("DIAGNOSTIC_ACTIVE");
+        if (!context.getSystemService(android.os.UserManager.class).isUserUnlocked()) {
+            throw new IllegalStateException("USER_LOCKED");
+        }
+        if (!new BandStateRepository(context).isRegistered()) {
+            throw new IllegalStateException("DEVICE_NOT_REGISTERED");
+        }
+        if (!new OwnershipController(context).nativeReady()) {
+            throw new IllegalStateException("NATIVE_OWNERSHIP_REQUIRED");
+        }
+    }
+
+    private static void launch(Context context, boolean waitForRoot) {
+        try {
+            context.startForegroundService(new Intent(context, BandLiveService.class));
+        } catch (RuntimeException backgroundRejected) {
+            if (waitForRoot) HostKeepAlive.startBridge(context);
+            else HostKeepAlive.startBridgeAsync(context);
+        }
+    }
+
+    public static void stop(Context context) {
+        BandLiveService live = instance;
+        if (live != null) live.requestStop();
+        context.stopService(new Intent(context, BandLiveService.class));
+    }
+
+    public static void pauseForDiagnostic(Context context) throws InterruptedException {
+        diagnosticPaused = true;
+        BandLiveService live = instance;
+        stop(context);
+        if (live != null && (!live.destroyed.await(10, TimeUnit.SECONDS)
+                || !live.stopped.await(10, TimeUnit.SECONDS))) {
+            throw new IllegalStateException("LIVE_SESSION_STILL_ACTIVE");
+        }
+        if (!SppDiagnosticClient.stopAllAndWait()) throw new IllegalStateException("DIAGNOSTIC_SOCKET_STILL_ACTIVE");
+    }
+
+    public static void resumeAfterDiagnostic(Context context) {
+        diagnosticPaused = false;
+        if (new BandStateRepository(context).isRegistered() && new OwnershipController(context).nativeReady()) start(context);
+    }
+
+    /** Accepts a request without waiting for root checks, Bluetooth, or a Binder transaction. */
+    public static String requestSync(Context context) {
+        String blocked = ownershipBlocker(context);
+        if (blocked != null) return blocked;
+        BandLiveService live = instance;
+        if (live != null && !live.stopRequested) {
+            live.syncRequested = true;
+            synchronized (live.stopLock) {
+                live.retryNow = true;
+                live.stopLock.notifyAll();
+            }
+            try {
+                live.coordinator.execute(live::tick);
+                return "ACCEPTED";
+            } catch (java.util.concurrent.RejectedExecutionException stopping) {
+                return "OPEN_CONFIG_REQUIRED";
+            }
+        }
+        try {
+            start(context);
+            return "ACCEPTED";
+        } catch (RuntimeException denied) {
+            return "OPEN_CONFIG_REQUIRED";
+        }
+    }
+
+    /** One explicit user sync may bypass the sleep gate; later periodic rounds stay protected. */
+    public static String requestManualSync(Context context) {
+        String blocked = ownershipBlocker(context);
+        if (blocked != null) return blocked;
+        BandLiveService live = instance;
+        if (live != null && !live.stopRequested) {
+            return live.requestManualSyncNow() ? "ACCEPTED" : "SERVICE_STOPPING";
+        }
+        pendingManualSyncAtMs = android.os.SystemClock.elapsedRealtime();
+        try {
+            start(context);
+            return "ACCEPTED";
+        } catch (RuntimeException denied) {
+            pendingManualSyncAtMs = 0;
+            return "OPEN_CONFIG_REQUIRED";
+        }
+    }
+
+    private static String ownershipBlocker(Context context) {
+        if (diagnosticPaused) return "OPEN_CONFIG_REQUIRED";
+        if (!context.getSystemService(android.os.UserManager.class).isUserUnlocked()) return "OPEN_CONFIG_REQUIRED";
+        if (!new BandStateRepository(context).isRegistered()) return "DEVICE_NOT_REGISTERED";
+        var ownership = io.github.miam1ku.mibandoplusbridge.data.LocalPrefs.open(context, "ownership");
+        if (!"NATIVE".equals(ownership.getString("mode", "OFFICIAL"))
+                || !ownership.getBoolean("ownsDisable", false)
+                || ownership.getBoolean("officialRestored", false)) return "NATIVE_OWNERSHIP_REQUIRED";
+        return null;
+    }
+
+    private boolean requestManualSyncNow() {
+        manualSyncRequestedAtMs = android.os.SystemClock.elapsedRealtime();
+        manualSyncRequested.set(true);
+        syncRequested = true;
+        synchronized (stopLock) {
+            retryNow = true;
+            stopLock.notifyAll();
+        }
+        try {
+            coordinator.execute(this::tick);
+            return true;
+        } catch (java.util.concurrent.RejectedExecutionException stopping) {
+            manualSyncRequested.set(false);
+            manualSyncRequestedAtMs = 0;
+            clearTransientCollectionStatus();
+            return false;
+        }
+    }
+
+    /** Switch-on starts a new baseline. A sleep already underway keeps playing. */
+    public static void sleepPauseChanged(Context context) {
+        BandLiveService live = instance;
+        if (live == null || live.stopRequested) return;
+        live.sleepPauseOn = io.github.miam1ku.mibandoplusbridge.notify.SleepMusic.enabled(context);
+        live.sleepMusic.reset();
+        live.sleepArmedAtMs = io.github.miam1ku.mibandoplusbridge.notify.SleepMusic.armedAt(context);
+        if (live.sleepPauseOn) {
+            live.nextSleepStateAt = System.nanoTime();
+            live.requestSleepState();
+        }
+    }
+
+    public static java.util.concurrent.CompletionStage<Void> requestWeather(Context context,
+            io.github.miam1ku.mibandoplusbridge.protocol.BandWeatherEncoder.Sample sample, boolean inspect) {
+        BandLiveService live = instance;
+        if (live == null || live.stopRequested || live.commands == null
+                || !new BandStateRepository(context).isRegistered()) {
+            return java.util.concurrent.CompletableFuture.failedFuture(new IllegalStateException("LIVE_SESSION_REQUIRED"));
+        }
+        return inspect ? live.weatherSync.inspectCities(sample) : live.weatherSync.send(sample);
+    }
+
+    /**
+     * Requests the band's complete report-data log bundle and receives the reverse MASS stream.
+     * The receiver is installed before report 2/80, so the first file fragment cannot race past us.
+     */
+    public static java.util.concurrent.CompletionStage<
+            io.github.miam1ku.mibandoplusbridge.protocol.XiaomiMassReceive.Result>
+            requestDeviceLogExport(Context context,
+                    java.util.function.Consumer<
+                            io.github.miam1ku.mibandoplusbridge.protocol.XiaomiMassReceive.Progress> observer) {
+        BandLiveService live = instance;
+        var client = live == null ? null : live.client;
+        var queue = live == null ? null : live.commands;
+        if (client == null || queue == null || live.stopRequested) {
+            return java.util.concurrent.CompletableFuture.failedFuture(
+                    new IllegalStateException("LIVE_SESSION_REQUIRED"));
+        }
+        File directory = new File(context.getCacheDir(),
+                "device-logs/" + System.currentTimeMillis());
+        if (!directory.isDirectory() && !directory.mkdirs()) {
+            return java.util.concurrent.CompletableFuture.failedFuture(
+                    new IllegalStateException("DEVICE_LOG_DIRECTORY_FAILED"));
+        }
+        java.util.function.Consumer<
+                io.github.miam1ku.mibandoplusbridge.protocol.XiaomiMassReceive.Progress> safe =
+                progress -> {
+                    if (observer == null) return;
+                    try {
+                        observer.accept(progress);
+                    } catch (RuntimeException ignored) { }
+                };
+        var receiver = new io.github.miam1ku.mibandoplusbridge.protocol.XiaomiMassReceive(
+                directory, safe);
+        if (deviceLogReceiver != null) {
+            return java.util.concurrent.CompletableFuture.failedFuture(
+                    new IllegalStateException("DEVICE_LOG_RECEIVE_ACTIVE"));
+        }
+        deviceLogReceiver = receiver;
+        try {
+            client.beginDeviceLogReceive(receiver);
+        } catch (Exception unavailable) {
+            deviceLogReceiver = null;
+            return java.util.concurrent.CompletableFuture.failedFuture(unavailable);
+        }
+        io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(context,
+                "DEVICE_LOG_EXPORT request");
+        return queue.request(
+                io.github.miam1ku.mibandoplusbridge.protocol.BandLogCommand.exportDeviceLog(),
+                2, 81, 120_000L)
+                .thenCompose(response -> {
+                    int status = io.github.miam1ku.mibandoplusbridge.protocol.BandLogCommand
+                            .resultStatus(response);
+                    if (status != 0) {
+                        client.cancelDeviceLogReceive(deviceLogStatus(status));
+                        return java.util.concurrent.CompletableFuture.failedFuture(
+                                new IllegalStateException(deviceLogStatus(status)));
+                    }
+                    io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(context,
+                            "DEVICE_LOG_EXPORT receiving");
+                    java.util.concurrent.CompletableFuture<
+                            io.github.miam1ku.mibandoplusbridge.protocol.XiaomiMassReceive.Result>
+                            completion = receiver.completion().toCompletableFuture();
+                    completion.orTimeout(10, TimeUnit.MINUTES);
+                    return completion.whenComplete((result, error) -> {
+                        if (error != null) {
+                            client.cancelDeviceLogReceive("DEVICE_LOG_RECEIVE_FAILED");
+                            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(context,
+                                    "DEVICE_LOG_EXPORT failed " + error.getClass().getSimpleName());
+                        } else {
+                            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(context,
+                                    "DEVICE_LOG_EXPORT complete bytes=" + result.bytes());
+                        }
+                    });
+                }).whenComplete((result, error) -> {
+                    deviceLogReceiver = null;
+                    if (error != null) client.cancelDeviceLogReceive("DEVICE_LOG_EXPORT_FAILED");
+                });
+    }
+
+    public static io.github.miam1ku.mibandoplusbridge.protocol.XiaomiMassReceive.Progress
+            deviceLogProgressSnapshot() {
+        var receiver = deviceLogReceiver;
+        return receiver == null
+                ? new io.github.miam1ku.mibandoplusbridge.protocol.XiaomiMassReceive.Progress(
+                        0, 0, "", 0)
+                : receiver.progressSnapshot();
+    }
+
+    private static String deviceLogStatus(int status) {
+        return switch (status) {
+            case 1 -> "DEVICE_LOG_NO_DATA";
+            case 2 -> "DEVICE_LOG_DIRECT_UPLOAD_UNSUPPORTED";
+            case 3 -> "DEVICE_LOG_DEVICE_BUSY";
+            case 10 -> "DEVICE_LOG_DEVICE_REJECTED";
+            default -> "DEVICE_LOG_RESULT_INVALID";
+        };
+    }
+
+    public static void refreshWeather(Context context) {
+        BandLiveService live = instance;
+        if (live != null && !live.stopRequested && new BandStateRepository(context).isRegistered()) {
+            live.weatherSync.refreshAndSend();
+        }
+    }
+
+    public static boolean notificationSessionReady(Context context) {
+        BandLiveService live = instance;
+        if (live == null || live.stopRequested || live.commands == null
+                || !new BandStateRepository(context).isRegistered()) return false;
+        var owner = io.github.miam1ku.mibandoplusbridge.data.LocalPrefs.open(context, "ownership");
+        return "NATIVE".equals(owner.getString("mode", "OFFICIAL"))
+                && owner.getBoolean("ownsDisable", false) && !owner.getBoolean("officialRestored", false);
+    }
+    private static String sessionReason(Context context) {
+        BandLiveService live = instance;
+        if (live == null || live.stopRequested || live.commands == null) return "service";
+        boolean registered = new BandStateRepository(context).isRegistered();
+        var owner = io.github.miam1ku.mibandoplusbridge.data.LocalPrefs.open(context, "ownership");
+        return "session registered=" + registered
+                + " mode=" + owner.getString("mode", "OFFICIAL")
+                + " ownsDisable=" + owner.getBoolean("ownsDisable", false)
+                + " restored=" + owner.getBoolean("officialRestored", false);
+    }
+
+    public static boolean callsOwned() {
+        BandLiveService live = instance;
+        return live != null && live.calls != null && live.calls.ownsCalls();
+    }
+
+    public static void noteCallAnswered() {
+        BandLiveService live = instance;
+        if (live != null && live.calls != null) live.calls.noteAnswered();
+    }
+
+    private void logFeatures() {
+        var settings = getSharedPreferences("notification-settings", MODE_PRIVATE);
+        boolean access = io.github.miam1ku.mibandoplusbridge.notify.BandNotificationListener.accessGranted(this);
+        boolean up = io.github.miam1ku.mibandoplusbridge.notify.BandNotificationListener.listenerConnected();
+        String enabled = android.provider.Settings.Secure.getString(getContentResolver(), "enabled_notification_listeners");
+        boolean health = enabled != null && enabled.contains(
+                "com.heytap.health/com.heytap.health.watch.commonnotification.HeytapNotificationListenerService");
+        io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this, "features local="
+                + (up ? "up" : access ? "granted" : "absent")
+                + " healthListener=" + health
+                + " healthApproved=" + io.github.miam1ku.mibandoplusbridge.data.LocalPrefs.open(this,
+                        "notification-settings").getBoolean("healthApproved", false)
+                + " healthLive=" + io.github.miam1ku.mibandoplusbridge.notify.HealthListenerState.connected()
+                + " notify=" + settings.getBoolean("enabled", true)
+                + " packages=" + settings.getStringSet("packages", java.util.Set.of()).size()
+                + " calls=" + settings.getBoolean("callsEnabled", false)
+                + " callOwner=" + (calls != null && calls.ownsCalls())
+                + " music=" + io.github.miam1ku.mibandoplusbridge.notify.PhoneMusic.attached());
+        io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this, "hosts "
+                + hostVersion("com.coloros.alarmclock")
+                + " " + hostVersion("com.heytap.health")
+                + " " + hostVersion("com.heytap.mydevices")
+                + " " + hostVersion(getPackageName()));
+    }
+
+    private String hostVersion(String pkg) {
+        String name = pkg == null ? "" : pkg.substring(pkg.lastIndexOf('.') + 1);
+        try {
+            android.content.pm.PackageInfo info = getPackageManager().getPackageInfo(pkg, 0);
+            return name + "=" + info.versionName + "/" + info.getLongVersionCode();
+        } catch (android.content.pm.PackageManager.NameNotFoundException missing) {
+            return name + "=absent";
+        }
+    }
+
+
+    public static long notificationSessionId() {
+        BandLiveService live = instance;
+        return live == null || live.stopRequested || live.commands == null ? 0 : live.sessionEpoch;
+    }
+
+    public static int notificationPayloadLimit() {
+        BandLiveService live = instance;
+        SppDiagnosticClient active = live == null ? null : live.client;
+        return active == null || live.commands == null ? 0 : active.notificationPayloadLimit();
+    }
+
+    public static java.util.concurrent.CompletionStage<Void> sendSessionCommand(
+            nodomain.freeyourgadget.gadgetbridge.proto.xiaomi.XiaomiProto.Command command) {
+        BandLiveService live = instance;
+        var queue = live == null ? null : live.commands;
+        if (queue == null || command == null || !command.isInitialized()) {
+            return java.util.concurrent.CompletableFuture.failedFuture(
+                    new IllegalStateException("NOTIFICATION_SESSION_UNAVAILABLE"));
+        }
+        if (command.getType() == 18 && command.getSubtype() == 1) lastMusic = command;
+        return queue.send(command);
+    }
+
+
+    public static java.util.concurrent.CompletionStage<Void> sendNotification(Context context,
+            nodomain.freeyourgadget.gadgetbridge.proto.xiaomi.XiaomiProto.Command command) {
+        if (!notificationCommand(command)) {
+            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(context, "NOTIFY_DROP reason=command");
+            return java.util.concurrent.CompletableFuture.failedFuture(
+                    new IllegalStateException("NOTIFICATION_SESSION_UNAVAILABLE"));
+        }
+        BandLiveService live = instance;
+        var queue = live == null ? null : live.commands;
+        var notification = command.getNotification();
+        boolean call = command.getSubtype() == 0 && notification.hasNotification2()
+                && io.github.miam1ku.mibandoplusbridge.protocol.BandNotificationCommand.isCall(
+                        notification.getNotification2().getNotification3());
+        boolean clearCall = command.getSubtype() == 1 && notification.hasNotificationDismiss()
+                && notification.getNotificationDismiss().getNotificationIdCount() == 1
+                && "phone".equals(notification.getNotificationDismiss().getNotificationId(0).getPackage())
+                && notification.getNotificationDismiss().getNotificationId(0).getId() == 0;
+        var settings = context.getSharedPreferences("notification-settings", MODE_PRIVATE);
+        if (call && (!settings.getBoolean("callsEnabled", false)
+                || context.checkSelfPermission(android.Manifest.permission.READ_PHONE_STATE)
+                        != android.content.pm.PackageManager.PERMISSION_GRANTED)) {
+            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(context, "NOTIFY_DROP reason=call-permission");
+            return java.util.concurrent.CompletableFuture.failedFuture(new IllegalStateException("CALL_PERMISSION_REQUIRED"));
+        }
+        if (!call && !clearCall) {
+            var manager = context.getSystemService(NotificationManager.class);
+            if (!settings.getBoolean("enabled", true) || !manager.isNotificationListenerAccessGranted(
+                    new android.content.ComponentName(context, io.github.miam1ku.mibandoplusbridge.notify.BandNotificationListener.class))) {
+                io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(context, "NOTIFY_DROP reason=access");
+                return java.util.concurrent.CompletableFuture.failedFuture(new IllegalStateException("NOTIFICATION_ACCESS_REQUIRED"));
+            }
+        }
+        if (queue == null || !notificationSessionReady(context)) {
+            if (mayWake(context)) return holdNotification(context, command);
+            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(context, "NOTIFY_DROP reason="
+                    + (queue == null ? "service" : sessionReason(context)));
+            return java.util.concurrent.CompletableFuture.failedFuture(
+                    new IllegalStateException("NOTIFICATION_SESSION_UNAVAILABLE"));
+        }
+        if (duplicate(context, command)) return java.util.concurrent.CompletableFuture.completedFuture(null);
+        if (suppressForDnd(command, io.github.miam1ku.mibandoplusbridge.notify.PhoneDnd.currentFilter(context))) {
+            android.util.Log.i("OplusBandBridge", "NOTIFY_SUPPRESSED_DND");
+            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(context, "NOTIFY_SUPPRESSED_DND");
+            return java.util.concurrent.CompletableFuture.completedFuture(null);
+        }
+        try {
+            var fitted = io.github.miam1ku.mibandoplusbridge.protocol.BandNotificationCommand.fitToPayload(command,
+                    notificationPayloadLimit());
+            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(context, "NOTIFY_OUT type=" + fitted.getType()
+                    + " subtype=" + fitted.getSubtype() + " bytes=" + fitted.getSerializedSize());
+            noteIconPackage(fitted);
+            routeWatchCall(context, fitted);
+            return queue.send(fitted);
+        } catch (IllegalArgumentException tooLarge) {
+            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(context, "NOTIFY_DROP reason=too-large");
+            return java.util.concurrent.CompletableFuture.failedFuture(new IllegalStateException("NOTIFICATION_IDENTITY_TOO_LARGE"));
+        }
+    }
+
+    /** OHealth already decided this notification may reach the band. */
+    public static java.util.concurrent.CompletionStage<Void> forwardHostNotification(Context context,
+            nodomain.freeyourgadget.gadgetbridge.proto.xiaomi.XiaomiProto.Command command) {
+        if (!notificationCommand(command)) {
+            android.util.Log.i("OplusBandBridge", "NOTIFY_DROP reason=command");
+            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(context, "NOTIFY_DROP reason=command");
+            return java.util.concurrent.CompletableFuture.failedFuture(
+                    new IllegalStateException("NOTIFICATION_SESSION_UNAVAILABLE"));
+        }
+        BandLiveService live = instance;
+        var queue = live == null ? null : live.commands;
+        if (queue == null || !notificationSessionReady(context)) {
+            if (mayWake(context)) return holdNotification(context, command);
+            String reason = queue == null ? "service" : sessionReason(context);
+            android.util.Log.i("OplusBandBridge", "NOTIFY_DROP reason=" + reason);
+            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(context, "NOTIFY_DROP reason=" + reason);
+            return java.util.concurrent.CompletableFuture.failedFuture(
+                    new IllegalStateException("NOTIFICATION_SESSION_UNAVAILABLE"));
+        }
+        if (duplicate(context, command)) return java.util.concurrent.CompletableFuture.completedFuture(null);
+        if (ordinaryPost(command) && io.github.miam1ku.mibandoplusbridge.notify.PhoneDnd.blocksNotifications(
+                io.github.miam1ku.mibandoplusbridge.notify.PhoneDnd.currentFilter(context))) {
+            android.util.Log.i("OplusBandBridge", "NOTIFY_SUPPRESSED_DND");
+            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(context, "NOTIFY_SUPPRESSED_DND");
+            return java.util.concurrent.CompletableFuture.completedFuture(null);
+        }
+        try {
+            var fitted = io.github.miam1ku.mibandoplusbridge.protocol.BandNotificationCommand.fitToPayload(
+                    command, notificationPayloadLimit());
+            android.util.Log.i("OplusBandBridge", "NOTIFY_OUT type=" + fitted.getType()
+                    + " subtype=" + fitted.getSubtype() + " bytes=" + fitted.getSerializedSize()
+                    + " limit=" + notificationPayloadLimit());
+            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(context, "NOTIFY_OUT type=" + fitted.getType()
+                    + " subtype=" + fitted.getSubtype() + " bytes=" + fitted.getSerializedSize());
+            noteIconPackage(fitted);
+            routeWatchCall(context, fitted);
+            return queue.send(fitted);
+        } catch (IllegalArgumentException tooLarge) {
+            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(context, "NOTIFY_DROP reason=too-large");
+            return java.util.concurrent.CompletableFuture.failedFuture(
+                    new IllegalStateException("NOTIFICATION_IDENTITY_TOO_LARGE"));
+        }
+    }
+
+    /** Watches show the call over HFP. The notification packet still carries the name. */
+    private static void routeWatchCall(Context context,
+            nodomain.freeyourgadget.gadgetbridge.proto.xiaomi.XiaomiProto.Command command) {
+        var notification = command.getNotification();
+        boolean call = command.getSubtype() == 0 && notification.hasNotification2()
+                && io.github.miam1ku.mibandoplusbridge.protocol.BandNotificationCommand.isCall(
+                        notification.getNotification2().getNotification3());
+        boolean clearCall = command.getSubtype() == 1 && notification.hasNotificationDismiss()
+                && notification.getNotificationDismiss().getNotificationIdCount() == 1
+                && "phone".equals(notification.getNotificationDismiss().getNotificationId(0).getPackage())
+                && notification.getNotificationDismiss().getNotificationId(0).getId() == 0;
+        if (!call && !clearCall) return;
+        String model = io.github.miam1ku.mibandoplusbridge.data.LocalPrefs.open(context, "band-state")
+                .getString("modelId", "");
+        if (!io.github.miam1ku.mibandoplusbridge.data.BandCatalog.watchForm(model)) return;
+        int state = call ? notification.getNotification2().getNotification3().getCallState() : 0;
+        io.github.miam1ku.mibandoplusbridge.notify.WatchCallHeadset.apply(context,
+                io.github.miam1ku.mibandoplusbridge.notify.WatchCallRoute.link(true, state));
+    }
+
+    private static boolean notificationCommand(
+            nodomain.freeyourgadget.gadgetbridge.proto.xiaomi.XiaomiProto.Command command) {
+        return command != null && command.getType() == 7
+                && (command.getSubtype() == 0 || command.getSubtype() == 1)
+                && command.hasNotification();
+    }
+
+    private static java.util.concurrent.CompletionStage<Void> holdNotification(Context context,
+            nodomain.freeyourgadget.gadgetbridge.proto.xiaomi.XiaomiProto.Command command) {
+        io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(context, "NOTIFY_HOLD");
+        return HELD_NOTIFICATIONS.add(command, android.os.SystemClock.elapsedRealtime());
+    }
+
+    private void expireHeld() {
+        int expired = HELD_NOTIFICATIONS.expire(android.os.SystemClock.elapsedRealtime());
+        if (expired > 0) io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this,
+                "NOTIFY_DROP reason=expired count=" + expired);
+    }
+
+    private void replayHeld() {
+        long now = android.os.SystemClock.elapsedRealtime();
+        int expired = HELD_NOTIFICATIONS.expire(now);
+        if (expired > 0) io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this,
+                "NOTIFY_DROP reason=expired count=" + expired);
+        for (var held : HELD_NOTIFICATIONS.poll(now)) deliverHeld(held);
+    }
+
+    private void deliverHeld(io.github.miam1ku.mibandoplusbridge.notify.NotifyReplay.Held held) {
+        var command = held.command;
+        var queue = commands;
+        if (queue == null || !notificationSessionReady(this)) {
+            held.fail(new IllegalStateException("NOTIFICATION_SESSION_UNAVAILABLE"));
+            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this, "NOTIFY_DROP reason=service");
+            return;
+        }
+        if (duplicate(this, command)) {
+            held.succeed();
+            return;
+        }
+        if (ordinaryPost(command) && io.github.miam1ku.mibandoplusbridge.notify.PhoneDnd.blocksNotifications(
+                io.github.miam1ku.mibandoplusbridge.notify.PhoneDnd.currentFilter(this))) {
+            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this, "NOTIFY_SUPPRESSED_DND");
+            held.succeed();
+            return;
+        }
+        try {
+            var fitted = io.github.miam1ku.mibandoplusbridge.protocol.BandNotificationCommand.fitToPayload(
+                    command, notificationPayloadLimit());
+            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this, "NOTIFY_OUT type=" + fitted.getType()
+                    + " subtype=" + fitted.getSubtype() + " bytes=" + fitted.getSerializedSize());
+            noteIconPackage(fitted);
+            routeWatchCall(this, fitted);
+            queue.send(fitted).whenComplete((ignored, error) -> {
+                if (error == null) held.succeed();
+                else held.fail(error);
+            });
+        } catch (IllegalArgumentException tooLarge) {
+            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this, "NOTIFY_DROP reason=too-large");
+            held.fail(new IllegalStateException("NOTIFICATION_IDENTITY_TOO_LARGE"));
+        }
+    }
+
+    static boolean suppressForDnd(
+            nodomain.freeyourgadget.gadgetbridge.proto.xiaomi.XiaomiProto.Command command, int filter) {
+        return ordinaryPost(command) && io.github.miam1ku.mibandoplusbridge.notify.PhoneDnd
+                .blocksNotifications(filter);
+    }
+
+    private static boolean ordinaryPost(nodomain.freeyourgadget.gadgetbridge.proto.xiaomi.XiaomiProto.Command command) {
+        if (command.getSubtype() != 0 || !command.hasNotification()
+                || !command.getNotification().hasNotification2()) return false;
+        return !io.github.miam1ku.mibandoplusbridge.protocol.BandNotificationCommand.isCall(
+                command.getNotification().getNotification2().getNotification3());
+    }
+
+    private static boolean duplicate(Context context,
+            nodomain.freeyourgadget.gadgetbridge.proto.xiaomi.XiaomiProto.Command command) {
+        if (command == null || (!ordinaryPost(command) && !ordinaryDismiss(command))) return false;
+        if (NOTIFICATIONS.first(io.github.miam1ku.mibandoplusbridge.notify.NotifyDedupe.identity(command),
+                android.os.SystemClock.elapsedRealtime())) return false;
+        io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(context, "NOTIFY_DROP reason=duplicate");
+        return true;
+    }
+
+    private static boolean ordinaryDismiss(
+            nodomain.freeyourgadget.gadgetbridge.proto.xiaomi.XiaomiProto.Command command) {
+        if (command.getSubtype() != 1 || !command.hasNotification()
+                || !command.getNotification().hasNotificationDismiss()) return false;
+        var dismiss = command.getNotification().getNotificationDismiss();
+        if (dismiss.getNotificationIdCount() != 1) return false;
+        var id = dismiss.getNotificationId(0);
+        return !"phone".equals(id.getPackage());
+    }
+
+    public static void cancelNotifications(Context context) {
+        BandLiveService live = instance;
+        var queue = live == null ? null : live.commands;
+        if (queue != null) queue.cancelNotifications(new IllegalStateException("NOTIFICATION_CANCELLED"));
+    }
+
+    public static void cancelCall(Context context) {
+        BandLiveService live = instance;
+        var queue = live == null ? null : live.commands;
+        if (queue != null) queue.cancelCall(new IllegalStateException("CALL_CANCELLED"));
+    }
+
+    public static void refreshNotificationSettings(Context context) {
+        io.github.miam1ku.mibandoplusbridge.notify.BandNotificationListener.connectionChanged();
+        BandLiveService live = instance;
+        if (live != null && !live.stopRequested) live.calls.refresh();
+    }
+
+    @Override public void onCreate() {
+        super.onCreate();
+        io.github.miam1ku.mibandoplusbridge.data.SessionLog.start(this);
+        io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this, "module start");
+        restoreBondBudget();
+        io.github.miam1ku.mibandoplusbridge.data.DeviceImageStore.requestRefresh(this);
+        dndSync.seed(bandSyncEnabled(this));
+        dndSyncStored = dndSync.on();
+        weatherSync = new WeatherSync(this, () -> commands, coordinator);
+        healthReplay = new HealthReplay(this, this::healthCollectionStatus, () -> {
+            try {
+                coordinator.execute(() -> { if (!stopRequested && historySync != null) historySync.resume(); });
+            } catch (java.util.concurrent.RejectedExecutionException stopping) { }
+        });
+        calls = new io.github.miam1ku.mibandoplusbridge.notify.PhoneCallMonitor(this, coordinator);
+        io.github.miam1ku.mibandoplusbridge.notify.BandNotificationListener.ensureEnabled(this);
+        HostKeepAlive.runRoot(() -> {
+            try {
+                new OwnershipController(this).keepAwake();
+                io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this, "KEEP_AWAKE");
+            } catch (RuntimeException ignored) { }
+            // ColourOS freezes this process through the framework cgroup freezer; root can undo
+            // that within seconds and the guard shell survives the freeze itself.
+            io.github.miam1ku.mibandoplusbridge.service.RootFreezeGuard.start(this);
+        });
+        instance = this;
+        sleepPauseOn = io.github.miam1ku.mibandoplusbridge.notify.SleepMusic.enabled(this);
+        long armed = io.github.miam1ku.mibandoplusbridge.notify.SleepMusic.armedAt(this);
+        if (sleepPauseOn && armed == Long.MAX_VALUE) {
+            armed = System.currentTimeMillis();
+            io.github.miam1ku.mibandoplusbridge.notify.SleepMusic.rememberCutoff(this, armed);
+        }
+        sleepArmedAtMs = sleepPauseOn ? armed : Long.MAX_VALUE;
+        coordinator.scheduleAtFixedRate(this::tick, 1, 1, TimeUnit.MINUTES);
+        coordinator.scheduleAtFixedRate(this::expireHeld, 5, 5, TimeUnit.SECONDS);
+        try {
+            IntentFilter bluetooth = new IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED);
+            bluetooth.addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED);
+            registerReceiver(bluetoothEvents, bluetooth, RECEIVER_EXPORTED);
+            receiverRegistered = true;
+        } catch (RuntimeException ignored) { }
+        try {
+            registerReceiver(dndEvents, new IntentFilter(NotificationManager.ACTION_INTERRUPTION_FILTER_CHANGED),
+                    RECEIVER_EXPORTED);
+            dndReceiverRegistered = true;
+        } catch (RuntimeException ignored) { }
+        try {
+            android.content.ContentResolver resolver = getContentResolver();
+            resolver.registerContentObserver(
+                    android.provider.Settings.Global.getUriFor("zen_mode"), false, zenMode);
+            resolver.registerContentObserver(
+                    android.provider.Settings.Secure.getUriFor("focusmode_switch"), false, zenMode);
+            resolver.registerContentObserver(
+                    android.provider.Settings.Secure.getUriFor("focusmode_switch_new"), false, zenMode);
+            resolver.registerContentObserver(
+                    android.provider.Settings.Secure.getUriFor("op_breath_mode_status"), false, zenMode);
+        } catch (RuntimeException ignored) { }
+    }
+
+    @Override public IBinder onBind(Intent intent) { return null; }
+
+    @Override public int onStartCommand(Intent intent, int flags, int startId) {
+        if (diagnosticPaused || !getSystemService(android.os.UserManager.class).isUserUnlocked()
+                || !new BandStateRepository(this).isRegistered()) {
+            pendingManualSyncAtMs = 0;
+            clearTransientCollectionStatus();
+            requestStop();
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+        synchronized (stopLock) {
+            stopRequested = false;
+            stopLock.notifyAll();
+        }
+        if (intent != null && ACTION_SYNC.equals(intent.getAction())) syncRequested = true;
+        long pendingManualAtMs = pendingManualSyncAtMs;
+        pendingManualSyncAtMs = 0;
+        if (pendingManualAtMs > 0
+                && android.os.SystemClock.elapsedRealtime() - pendingManualAtMs <= PENDING_MANUAL_SYNC_TTL_MS) {
+            requestManualSyncNow();
+        } else if (pendingManualAtMs > 0) {
+            clearTransientCollectionStatus();
+        }
+        if (intent != null && ACTION_REPAIR.equals(intent.getAction())) {
+            // The user tapped 「重新配对」, so one more pairing request is expected on the wrist.
+            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this, "bond repair manual");
+            bondRecovery.manualRetry();
+            persistBondBudget();
+            repairBond();
+            synchronized (stopLock) {
+                retryNow = true;
+                stopLock.notifyAll();
+            }
+        }
+        if (running.compareAndSet(false, true)) {
+            stopped = new java.util.concurrent.CountDownLatch(1);
+            show("正在连接手环");
+            worker.execute(this::supervise);
+        }
+        io.github.miam1ku.mibandoplusbridge.notify.BandNotificationListener.ensureEnabled(this);
+        return START_STICKY;
+    }
+
+    /** ColorOS freezes a process whose task was swiped, even while this service is still running. */
+    @Override public void onTaskRemoved(android.content.Intent rootIntent) {
+        if (stopRequested || !mayWake(this)) return;
+        io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this, "TASK_REMOVED keep");
+        String title = noticeTitle == null || noticeTitle.isBlank() ? "正在连接手环" : noticeTitle;
+        noticeTitle = null;
+        show(title);
+        io.github.miam1ku.mibandoplusbridge.notify.BandNotificationListener.ensureEnabled(this);
+        synchronized (stopLock) {
+            retryNow = true;
+            stopLock.notifyAll();
+        }
+    }
+
+    private void requestStop() {
+        synchronized (stopLock) {
+            stopRequested = true;
+            stopLock.notifyAll();
+        }
+        cancelOfflineGrace();
+        int dropped = HELD_NOTIFICATIONS.failAll(new IllegalStateException("NOTIFICATION_SESSION_UNAVAILABLE"));
+        if (dropped > 0) io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this,
+                "NOTIFY_DROP reason=stopped count=" + dropped);
+        SppDiagnosticClient active = client;
+        if (active != null) active.close();
+    }
+
+    private void supervise() {
+        supervisorBeatMs = android.os.SystemClock.elapsedRealtime();
+        try {
+            superviseLoop();
+        } catch (Throwable fatal) {
+            // A worker thread that dies here takes every scheduled reconnect with it, while the
+            // foreground notice still says 「正在连接手环」. Keep the service recoverable instead.
+            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this,
+                    "supervise crashed " + fatal.getClass().getSimpleName()
+                            + (fatal.getMessage() == null ? "" : " " + fatal.getMessage()));
+            running.set(false);
+            try { stopForeground(STOP_FOREGROUND_REMOVE); } catch (RuntimeException ignored) { }
+            try { stopSelf(); } catch (RuntimeException ignored) { }
+        }
+    }
+
+    private void superviseLoop() {
+        BandStateRepository repository = new BandStateRepository(this);
+        long backoff = INITIAL_BACKOFF_MS;
+        /**
+         * Sessions in a row that never authenticated. The band accepts the socket and then never
+         * answers the version request when it is in its after-close state, and poking it every
+         * thirty seconds kept it there for twenty minutes. Three blanks are enough to slow down.
+         */
+        int blank = 0;
+        String status = "STARTING";
+        try {
+            try { repository.markSessionClosed(); } catch (RuntimeException ignored) { }
+            while (!stopRequested) {
+                supervisorBeatMs = android.os.SystemClock.elapsedRealtime();
+                OwnershipController owner = new OwnershipController(this);
+                if (!repository.isRegistered() || !owner.nativeReady()) {
+                    status = "REGISTERED_NATIVE_DEVICE_REQUIRED registered="
+                            + repository.isRegistered() + " mode=" + owner.mode()
+                            + " ready=" + owner.nativeReady();
+                    android.util.Log.i("OplusBandBridge", status);
+                    show("连接已暂停");
+                    break;
+                }
+                bindHealthHost();
+                AtomicInteger stored = new AtomicInteger();
+                AtomicBoolean authenticated = new AtomicBoolean();
+                long epoch = SESSION_IDS.incrementAndGet();
+                sessionEpoch = epoch;
+                SppDiagnosticClient active = new SppDiagnosticClient(this, code -> {
+                    if (stopRequested || epoch != sessionEpoch) return;
+                    if ("HISTORY_FRAGMENT_RECEIVED".equals(code)) {
+                        coordinator.execute(() -> {
+                            if (epoch == sessionEpoch && historySync != null) historySync.progress();
+                        });
+                    } else if ("HISTORY_FILE_ARCHIVED".equals(code)) {
+                        healthReplay.request();
+                        stored.incrementAndGet();
+                    } else if ("HISTORY_FORMAT_UNSUPPORTED".equals(code)) {
+                        healthCollectionStatus(code);
+                    } else if ("HISTORY_FILE_REJECTED".equals(code) || "HISTORY_STORAGE_FAILED".equals(code)
+                            || "HISTORY_CONFIRMATION_PENDING".equals(code)) {
+                        coordinator.execute(() -> {
+                            if (epoch == sessionEpoch && historySync != null) historySync.rejected(code);
+                        });
+                        healthCollectionStatus(code);
+                    }
+                });
+                active.setSleepFiles(measurements -> {
+                    try {
+                        coordinator.execute(() -> {
+                            if (!stopRequested) noteSleepFile(measurements);
+                        });
+                    } catch (java.util.concurrent.RejectedExecutionException stopping) { }
+                });
+                client = active;
+                try {
+                    active.runLive(result -> {
+                        authenticated.set(true);
+                        bondRecovery.connected(android.os.SystemClock.elapsedRealtime());
+                        try {
+                            repository.recordVerifiedDevice(result.batteryPercent(), result.batteryState(), true,
+                                    result.firmware(), result.hardware(), result.sku());
+                            io.github.miam1ku.mibandoplusbridge.data.DeviceImageStore.requestRefresh(this);
+                        } catch (Exception failure) {
+                            throw new IllegalStateException(failure.getMessage(), failure);
+                        }
+                        if (!repository.isRegistered() || stopRequested) return;
+                        writeStatus("CONNECTED");
+                        show("手环已连接");
+                        // Anything still waiting to publish 断开 is stale the moment a session
+                        // authenticates again, which is every three seconds after the band's close.
+                        cancelOfflineGrace();
+                    }, queue -> {
+                        coordinator.execute(() -> {
+                        if (client != active || stopRequested) {
+                            queue.close(new IllegalStateException("SESSION_CLOSED"));
+                            return;
+                        }
+                        commands = queue;
+                        replayHeld();
+                        calls.connected();
+                        logFeatures();
+                        io.github.miam1ku.mibandoplusbridge.notify.BandNotificationListener.connectionChanged();
+                        io.github.miam1ku.mibandoplusbridge.notify.NativeMusic.requestRefresh(this);
+                        int[] weatherEpoch = {0};
+                        historySync = new LiveHistorySync(queue, coordinator,
+                                () -> weatherEpoch[0] = weatherSync.deferForecast(), () -> {
+                            try {
+                                repository.recordSyncCompleted();
+                                clearStoragePause();
+                                clearTransientCollectionStatus();
+                            } catch (RuntimeException unavailable) {
+                                healthCollectionStatus("HEALTH_STORAGE_UNAVAILABLE");
+                            }
+                            weatherSync.releaseForecast(weatherEpoch[0]);
+                            // Hand this round to Mi Health, which otherwise never sees it: the
+                            // bridge is the band's only client. Guarded inside by the auto switch,
+                            // the screen state and a ten-minute floor.
+                            io.github.miam1ku.mibandoplusbridge.health.MiHealthAutoSync
+                                    .onHistoryCompleted(this);
+                        }, reason -> {
+                            healthCollectionStatus(reason);
+                            weatherSync.releaseForecast(weatherEpoch[0]);
+                        }, healthReplay::hasCapacity);
+                        long now = System.nanoTime();
+                        sessionStartAtMs = System.currentTimeMillis();
+                        loadSleepStateCapability(repository);
+                        nextBatteryAt = now + TimeUnit.MINUTES.toNanos(BATTERY_POLL_MINUTES);
+                        nextHealthAt = now + TimeUnit.MINUTES.toNanos(historyPeriodMinutes());
+                        nextWeatherAt = now + TimeUnit.MINUTES.toNanos(30);
+                        bandAsleep = null;
+                        bandAsleepAtMs = 0;
+                        historyDeferredSinceMs = 0;
+                        awakeSamples = 0;
+                        quietStepsValue = Long.MIN_VALUE;
+                        quietCheckedAtMs = 0;
+                        quietBaselineSteps = -1;
+                        quietSampleAtMs = 0;
+                        quietSignalStale = false;
+                        nightQuietResult = false;
+                        nightHadQuiet = false;
+                        wakeEvidence.reset();
+                        wakeEvidenceCheckedAtMs = 0;
+                        lastHistoryDeferLine = null;
+                        boolean night = isNightWindow();
+                        boolean restartCooldown = night && lastNightFlushAtMs > 0
+                                && sessionStartAtMs >= lastNightFlushAtMs
+                                && sessionStartAtMs - lastNightFlushAtMs
+                                        < TimeUnit.MINUTES.toMillis(NIGHT_RESTART_COOLDOWN_MINUTES);
+                        historyCooldownUntilMs = restartCooldown
+                                ? sessionStartAtMs
+                                        + TimeUnit.MINUTES.toMillis(NIGHT_RESTART_COOLDOWN_MINUTES)
+                                : 0;
+                        historySyncPending = !restartCooldown;
+                        pendingHistoryIncludesHistory = !night;
+                        if (sleepStateUnsupported) {
+                            waitingForInitialSleepState = false;
+                            historyStateDeadlineAt = 0;
+                        } else {
+                            waitingForInitialSleepState = true;
+                            historyStateDeadlineAt = now
+                                    + TimeUnit.SECONDS.toNanos(INITIAL_HISTORY_SYNC_WAIT_SECONDS);
+                        }
+                        if (restartCooldown) {
+                            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this,
+                                    "HISTORY_SYNC restart cooldown active");
+                        }
+                        nextSleepStateAt = now + TimeUnit.MINUTES.toNanos(SLEEP_STATE_POLL_MINUTES);
+                        nextNightStatsAt = now;
+                        syncRequested = false;
+                        maybeWakeCatchup(now);
+                        healthReplay.request();
+                        dndSync.newLink();
+                        main.removeCallbacks(dndAskFallback);
+                        if (!(night && restartCooldown)) {
+                            queue.send(realtimeStats(REALTIME_STATS_START));
+                            realtimeStatsStopPending = true;
+                            nextNightStatsAt = now + TimeUnit.MINUTES.toNanos(NIGHT_STATS_REFRESH_MINUTES);
+                            coordinator.schedule(() -> {
+                                if (epoch == sessionEpoch) stopRealtimeStats();
+                            }, REALTIME_STATS_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                        }
+                        syncDnd();
+                        // Baseline at every hour: the initial history pull waits for it.
+                        requestSleepState(true);
+                        });
+                    }, fileId -> coordinator.execute(() -> {
+                        if (client == active && !stopRequested && historySync != null) historySync.saved(fileId);
+                    }), command -> {
+                        if (command.getType() == 2) {
+                            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(BandLiveService.this,
+                                    describeSystem(command));
+                            noteBandRules(command);
+                            noteBandDndSync(command);
+                            if (command.getSubtype() == 109) adoptStoredBand();
+                            applyBandManual(command);
+                            coordinator.execute(() -> {
+                                if (epoch == sessionEpoch) noteSleep(command);
+                            });
+                        } else if (command.getType() == 10 || command.getType() == 7 || command.getType() == 18) {
+                            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(BandLiveService.this,
+                                    "rx type=" + command.getType() + " subtype=" + command.getSubtype()
+                                            + " status=" + command.getStatus());
+                        }
+                        if (command.getType() == 7) {
+                            android.util.Log.i("OplusBandBridge", "NOTIFY_IN subtype=" + command.getSubtype()
+                                    + " status=" + command.getStatus());
+                            if (command.getSubtype() == 16 && command.hasNotification()
+                                    && command.getNotification().hasNotificationIconQuery()) {
+                                offerIcon(command.getNotification().getNotificationIconQuery().getPackage());
+                            }
+                            if (command.getSubtype() == 15 && command.hasNotification()
+                                    && command.getNotification().hasNotificationIconRequest()) {
+                                uploadIcon(active, command.getNotification().getNotificationIconRequest());
+                            }
+                            if (calls != null) calls.onBandCommand(command);
+                        }
+                        if (command.getType() == 2 && command.getSubtype() == 17) {
+                            main.post(() -> io.github.miam1ku.mibandoplusbridge.notify.FindPhone
+                                    .onBandCommand(BandLiveService.this, command));
+                        }
+                        if (command.getType() == 18) {
+                            if (command.getSubtype() == 0) {
+                                io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(BandLiveService.this,
+                                        "MUSIC_REQ");
+                                main.post(BandLiveService.this::replyMusic);
+                            }
+                            main.post(() -> io.github.miam1ku.mibandoplusbridge.notify.NativeMusic
+                                    .onBandCommand(BandLiveService.this, command));
+                        }
+                        if (command.getType() == 2 && command.getSubtype() == 43) {
+                            main.post(BandLiveService.this::replySilent);
+                        }
+                        if (command.getType() == 17 && command.getSubtype() == 16) {
+                            int op = command.hasSchedule() && command.getSchedule().hasPhoneAlarmOperation()
+                                    ? command.getSchedule().getPhoneAlarmOperation().getOpCode() : -1;
+                            int alarmId = op >= 0 && command.getSchedule().getPhoneAlarmOperation().hasPhoneAlarm()
+                                    ? command.getSchedule().getPhoneAlarmOperation().getPhoneAlarm().getId() : -1;
+                            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(BandLiveService.this,
+                                    "ALARM_FROM_BAND op=" + op + " id=" + alarmId);
+                            if (op == 1 || op == 2) {
+                                io.github.miam1ku.mibandoplusbridge.integration.PhoneAlarmProvider.offer(op, alarmId);
+                            }
+                        }
+                        weatherSync.onCommand(command);
+                        if (command.getType() == 8 && command.getSubtype() == 47 && command.hasHealth()
+                                && command.getHealth().hasRealTimeStats()) {
+                            int steps = command.getHealth().getRealTimeStats().getSteps();
+                            coordinator.execute(() -> {
+                                if (epoch != sessionEpoch || steps < 0 || steps > 200_000) return;
+                                try {
+                                    repository.recordDailySteps(steps, System.currentTimeMillis(), true);
+                                } catch (RuntimeException ignored) { }
+                                if (steps > 0) stopRealtimeStats();
+                            });
+                        }
+                        if (command.getType() == 8 && command.hasStatus() && command.getStatus() != 0) {
+                            coordinator.execute(() -> {
+                                if (epoch == sessionEpoch && historySync != null) historySync.onCommand(command);
+                            });
+                        }
+                    });
+                    status = "CLOSED files=" + stored.get();
+                } catch (Exception failure) {
+                    status = failure instanceof SppDiagnosticClient.Failure typed
+                            ? typed.code : failure.getClass().getSimpleName();
+                    if ("OFFICIAL_PAIRING_REQUIRED".equals(status)) repairBond();
+                    show(statusCopy(status));
+                    // Without this the file keeps saying CONNECTED until the whole loop exits, so the
+                    // app and the diagnostics page describe a session that already died.
+                    writeStatus("RECONNECTING");
+                } finally {
+                    client = null;
+                    commands = null;
+                    supervisorBeatMs = android.os.SystemClock.elapsedRealtime();
+                    realtimeStatsStopPending = false;
+                    try {
+                        coordinator.execute(() -> {
+                            if (epoch == sessionEpoch && commands == null && historySync != null) {
+                                historySync.close();
+                                historySync = null;
+                                manualSyncRequested.set(false);
+                                manualSyncRequestedAtMs = 0;
+                                clearTransientCollectionStatus();
+                            }
+                        });
+                    } catch (java.util.concurrent.RejectedExecutionException stopping) { }
+                    weatherSync.onDisconnected();
+                    calls.disconnected();
+                    io.github.miam1ku.mibandoplusbridge.notify.BandNotificationListener.connectionChanged();
+                    if (authenticated.get()) blank = 0;
+                    else blank++;
+                    // A pending pairing is not an absent band: the wrist is right here and the user
+                    // has a confirm prompt in front of them, so publishing 断开 there is noise.
+                    boolean pairing = "BOND_BUSY".equals(status)
+                            || "OFFICIAL_PAIRING_REQUIRED".equals(status);
+                    if ((authenticated.get() || pairing) && !stopRequested && repository.isRegistered()) {
+                        // The band closed a link that was up a moment ago and the worker reopens in
+                        // about three seconds, so the drop is not published yet. A session that
+                        // never authenticated has nothing to hide and clears the state at once —
+                        // unless it is waiting on a pairing, which must not restart someone else's
+                        // countdown on every attempt.
+                        if (authenticated.get() || offlineGrace == null) scheduleOfflineGrace(status);
+                    } else if (offlineGrace != null) {
+                        // A grace is still pending from the last loss: it owns the published state
+                        // and publishes on its own deadline, so a retry that fails early must not
+                        // cut that window short.
+                        io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this,
+                                "session retry keeps grace status=" + status);
+                    } else {
+                        try { repository.markSessionClosed(); } catch (RuntimeException ignored) { }
+                    }
+                }
+                if (authenticated.get()) backoff = INITIAL_BACKOFF_MS;
+                if (stopRequested) break;
+                // A band that answers nothing is not a band that wants another attempt in three
+                // seconds, so a run of blank sessions drops to the lockout pace.
+                long delay = blank >= 3 ? LOCKOUT_PROBE_MS
+                        : retryable(status) ? backoff : QUIET_BACKOFF_MS;
+                if (!waitForRetry(delay)) break;
+                supervisorBeatMs = android.os.SystemClock.elapsedRealtime();
+                if (!authenticated.get() && retryable(status)) backoff = Math.min(backoff * 2, MAX_BACKOFF_MS);
+            }
+        } finally {
+            writeStatus(stopRequested ? "STOPPED" : status);
+            running.set(false);
+            stopped.countDown();
+            stopForeground(STOP_FOREGROUND_REMOVE);
+            stopSelf();
+        }
+    }
+
+    private void bindHealthHost() {
+        if (healthBound || stopRequested) return;
+        try {
+            if (!io.github.miam1ku.mibandoplusbridge.HostIdentity.installed(this, HEALTH_PACKAGE)) {
+                healthHostStatus("UNAVAILABLE");
+                return;
+            }
+            var service = getPackageManager().getServiceInfo(HEALTH_SERVICE, 0);
+            // Version drift is a one-time home-screen hint, not a reason to refuse the import bind.
+            if (!service.enabled || !service.exported
+                    || !service.applicationInfo.enabled || !HEALTH_PACKAGE.equals(service.processName)
+                    || (service.permission != null && !service.permission.isBlank())) {
+                healthHostStatus("UNAVAILABLE");
+                return;
+            }
+            main.post(() -> {
+                if (healthBound || stopRequested || !new BandStateRepository(this).isRegistered()) return;
+                try {
+                    healthBound = bindService(new Intent().setComponent(HEALTH_SERVICE), healthConnection, BIND_AUTO_CREATE);
+                    if (!healthBound) {
+                        healthHostStatus("UNAVAILABLE");
+                        reviveHealth();
+                    }
+                } catch (RuntimeException unavailable) {
+                    healthHostStatus("UNAVAILABLE");
+                    reviveHealth();
+                }
+            });
+        } catch (android.content.pm.PackageManager.NameNotFoundException unavailable) {
+            healthHostStatus("UNAVAILABLE");
+        }
+    }
+
+    private void unbindHealthHost() {
+        if (healthBound) {
+            unbindService(healthConnection);
+            healthBound = false;
+        }
+    }
+
+    private void reviveHealth() {
+        HostKeepAlive.startHealthAsync(this, () -> main.post(() -> {
+            if (!stopRequested) bindHealthHost();
+        }));
+    }
+
+    private void healthHostStatus(String status) {
+        getSharedPreferences("live-service", MODE_PRIVATE).edit().putString("healthHostStatus", status).apply();
+        getContentResolver().notifyChange(io.github.miam1ku.mibandoplusbridge.integration.DeviceCardProvider.URI, null);
+    }
+
+    private void healthCollectionStatus(String status) {
+        getSharedPreferences("live-service", MODE_PRIVATE).edit().putString("healthCollectionStatus", status).apply();
+        getContentResolver().notifyChange(io.github.miam1ku.mibandoplusbridge.integration.DeviceCardProvider.URI, null);
+    }
+    /** A later successful round clears a storage pause that already ended. */
+    private void clearStoragePause() {
+        String current = getSharedPreferences("live-service", MODE_PRIVATE)
+                .getString("healthCollectionStatus", "");
+        if ("HEALTH_STORAGE_UNAVAILABLE".equals(current) || "HISTORY_STORAGE_FAILED".equals(current)) {
+            healthCollectionStatus("");
+        }
+    }
+
+    private void clearTransientCollectionStatus() {
+        String current = getSharedPreferences("live-service", MODE_PRIVATE)
+                .getString("healthCollectionStatus", "");
+        if ("HISTORY_SYNCING".equals(current) || "HISTORY_SYNC_QUEUED".equals(current)) {
+            healthCollectionStatus("");
+        }
+    }
+
+
+    /** 45 starts the band's live-stats stream, 46 stops it, 47 is the periodic event. */
+    private static nodomain.freeyourgadget.gadgetbridge.proto.xiaomi.XiaomiProto.Command realtimeStats(int subtype) {
+        return nodomain.freeyourgadget.gadgetbridge.proto.xiaomi.XiaomiProto.Command.newBuilder()
+                .setType(8).setSubtype(subtype).build();
+    }
+
+    static boolean isNightWindow(int hour) {
+        return hour >= NIGHT_START_HOUR || hour < NIGHT_END_HOUR;
+    }
+
+    private static boolean isNightWindow() {
+        return isNightWindow(java.time.LocalTime.now().getHour());
+    }
+
+    static boolean nightStillSuppressed(int hour, boolean wakeEvidence) {
+        return isSleepProtectionWindow(hour) && !wakeEvidence;
+    }
+
+    public static boolean isSleepProtectionWindow(int hour) {
+        return hour >= NIGHT_START_HOUR || hour < NIGHT_HARD_END_HOUR;
+    }
+
+    private static boolean isSleepSuppressionWindow() {
+        return isSleepProtectionWindow(java.time.LocalTime.now().getHour());
+    }
+
+    /**
+     * The band's own sleep state is the cheapest wake evidence. History stays gated until 14:00
+     * without evidence, so keep asking through the late-morning hold until the band says awake;
+     * a fresh process at noon otherwise never learns it and waits for the hard end.
+     */
+    static boolean shouldPollSleepState(int hour, boolean nightTrackingEnabled, boolean wakeObserved) {
+        if (!nightTrackingEnabled) return false;
+        if (isNightWindow(hour)) return true;
+        return isSleepProtectionWindow(hour) && !wakeObserved;
+    }
+
+    private boolean shouldPollSleepStateNow() {
+        return shouldPollSleepState(java.time.LocalTime.now().getHour(), nightTrackingEnabled(),
+                wakeEvidence.observed());
+    }
+
+    private boolean nightTrackingEnabled() {
+        return !sleepStateUnsupported;
+    }
+
+    static long historyPeriodMinutes(int hour) {
+        return isNightWindow(hour) ? NIGHT_POLL_MINUTES : IDLE_POLL_MINUTES;
+    }
+
+    private static long historyPeriodMinutes() {
+        return historyPeriodMinutes(java.time.LocalTime.now().getHour());
+    }
+
+    static long nightStatsRefreshMinutes() {
+        return NIGHT_STATS_REFRESH_MINUTES;
+    }
+
+    static long quietSampleMaxAgeMinutes() {
+        return QUIET_SAMPLE_MAX_AGE_MINUTES;
+    }
+
+    static long nightPollMinutes() {
+        return NIGHT_POLL_MINUTES;
+    }
+
+    public static boolean sleepStateUnsupportedForCurrentDevice(Context context) {
+        try {
+            String deviceId = new BandStateRepository(context).deviceId();
+            return !deviceId.isBlank() && context.getSharedPreferences(LIVE_PREFS, MODE_PRIVATE)
+                    .getBoolean(sleepUnsupportedKey(deviceId), false);
+        } catch (RuntimeException unavailable) {
+            return false;
+        }
+    }
+
+    private static String sleepUnsupportedKey(String deviceId) {
+        return "sleepStateUnsupported_" + deviceId;
+    }
+
+    private static String lastNightFlushKey(String deviceId) {
+        return LAST_NIGHT_FLUSH + "_" + deviceId;
+    }
+
+    private void loadSleepStateCapability(BandStateRepository repository) {
+        String deviceId = repository.deviceId();
+        sleepStateUnsupported = !deviceId.isBlank() && getSharedPreferences(LIVE_PREFS, MODE_PRIVATE)
+                .getBoolean(sleepUnsupportedKey(deviceId), false);
+        sleepStateMisses = 0;
+        lastNightFlushAtMs = deviceId.isBlank() ? 0
+                : getSharedPreferences(LIVE_PREFS, MODE_PRIVATE).getLong(lastNightFlushKey(deviceId), 0);
+    }
+
+    private void persistSleepStateUnsupported(boolean unsupported) {
+        try {
+            String deviceId = new BandStateRepository(this).deviceId();
+            if (deviceId.isBlank()) return;
+            getSharedPreferences(LIVE_PREFS, MODE_PRIVATE).edit()
+                    .putBoolean(sleepUnsupportedKey(deviceId), unsupported).apply();
+        } catch (RuntimeException ignored) { }
+    }
+
+    @androidx.annotation.WorkerThread
+    private void noteSleepStateMiss() {
+        io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this, "SLEEP_STATE query missed");
+        android.util.Log.i("OplusBandBridge", "SLEEP_STATE_QUERY_FAILED");
+        sleepStateMisses++;
+        if (sleepStateMisses < SLEEP_STATE_MISS_LIMIT || sleepStateUnsupported) return;
+        sleepStateUnsupported = true;
+        waitingForInitialSleepState = false;
+        historyStateDeadlineAt = 0;
+        persistSleepStateUnsupported(true);
+        io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this,
+                "SLEEP_STATE unsupported, switching to quiet heuristic");
+    }
+
+    @androidx.annotation.WorkerThread
+    private void resetQuietTracker() {
+        quietStepsValue = Long.MIN_VALUE;
+        quietCheckedAtMs = 0;
+        quietBaselineSteps = -1;
+        quietSampleAtMs = 0;
+        quietSignalStale = false;
+        nightQuietResult = false;
+        nightHadQuiet = false;
+    }
+
+    /**
+     * The only place that advances the quiet tracker. It runs on the coordinator thread before
+     * any history gate is evaluated, so gate reads stay side-effect free.
+     */
+    @androidx.annotation.WorkerThread
+    private void advanceQuietTracker() {
+        if (!isSleepSuppressionWindow()) {
+            resetQuietTracker();
+            return;
+        }
+        long nowMs = System.currentTimeMillis();
+        if (quietCheckedAtMs > 0 && nowMs - quietCheckedAtMs < 60_000L) return;
+        quietCheckedAtMs = nowMs;
+        long steps;
+        long stepsAt;
+        try {
+            BandStateRepository repository = new BandStateRepository(this);
+            steps = repository.stepsToday();
+            stepsAt = repository.stepsAtMs();
+        } catch (RuntimeException unavailable) {
+            boolean changed = !quietSignalStale;
+            if (changed) requestNightStatsRefreshNow();
+            quietSignalStale = true;
+            nightQuietResult = true;
+            if (changed) {
+                io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this,
+                        "SLEEP_QUIET stale=true quiet=true steps=unavailable");
+            }
+            return;
+        }
+        if (steps < 0 || staleStepSample(nowMs, stepsAt)) {
+            boolean changed = !quietSignalStale;
+            if (changed) requestNightStatsRefreshNow();
+            quietSignalStale = true;
+            // Unknown is not awake. Keep history suppressed and request a fresh 8/45 sample.
+            nightQuietResult = true;
+            if (changed) {
+                io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this,
+                        "SLEEP_QUIET stale=true quiet=true steps=" + steps);
+            }
+            return;
+        }
+        boolean newSample = stepsAt != quietSampleAtMs;
+        boolean wasQuiet = nightQuietResult;
+        boolean counterReset = quietCounterReset(quietStepsValue, quietSampleAtMs, steps, stepsAt);
+        quietSampleAtMs = stepsAt;
+        quietSignalStale = false;
+        if (quietStepsValue == Long.MIN_VALUE) {
+            quietStepsValue = steps;
+            quietBaselineSteps = steps;
+            quietSinceMs = nowMs;
+            nightQuietResult = false;
+        } else if (counterReset) {
+            // A daily reset is not movement. Preserve the established quiet period.
+            quietStepsValue = steps;
+            quietBaselineSteps = steps;
+            nightQuietResult = quietElapsed(nowMs, quietSinceMs);
+        } else if (steps != quietStepsValue) {
+            if (quietStepNoise(steps, quietBaselineSteps)) {
+                // A handful of pedometer ticks do not end sleep; keep the original start.
+                quietStepsValue = steps;
+                nightQuietResult = quietElapsed(nowMs, quietSinceMs);
+            } else {
+                wakeEvidence.observe();
+                quietStepsValue = steps;
+                quietBaselineSteps = steps;
+                quietSinceMs = nowMs;
+                nightQuietResult = false;
+            }
+        } else {
+            nightQuietResult = quietElapsed(nowMs, quietSinceMs);
+        }
+        if (newSample || wasQuiet != nightQuietResult) {
+            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this,
+                    "SLEEP_QUIET stale=false quiet=" + nightQuietResult + " steps=" + steps);
+        }
+    }
+
+    private void requestNightStatsRefreshNow() {
+        nextNightStatsAt = System.nanoTime();
+    }
+
+    static boolean quietSuppressesHistory(boolean quiet, boolean stale) {
+        return quiet || stale;
+    }
+
+    private boolean nightQuietObserved() {
+        return quietSuppressesHistory(nightQuietResult, quietSignalStale);
+    }
+
+    static boolean staleStepSample(long nowMs, long stepsAtMs) {
+        return stepsAtMs <= 0
+                || nowMs - stepsAtMs > TimeUnit.MINUTES.toMillis(QUIET_SAMPLE_MAX_AGE_MINUTES);
+    }
+
+    static boolean quietCounterReset(long previousSteps, long previousAtMs, long steps, long stepsAtMs) {
+        if (previousSteps == Long.MIN_VALUE) return false;
+        if (steps < previousSteps) return true;
+        if (previousAtMs <= 0 || stepsAtMs <= previousAtMs) return false;
+        var zone = java.time.ZoneId.systemDefault();
+        return !java.time.Instant.ofEpochMilli(previousAtMs).atZone(zone).toLocalDate()
+                .equals(java.time.Instant.ofEpochMilli(stepsAtMs).atZone(zone).toLocalDate());
+    }
+
+    static boolean quietStepNoise(long steps, long baselineSteps) {
+        return baselineSteps >= 0 && steps >= baselineSteps
+                && steps - baselineSteps < QUIET_WAKE_STEPS;
+    }
+
+    static boolean quietElapsed(long nowMs, long quietSinceMs) {
+        return quietSinceMs > 0
+                && nowMs - quietSinceMs >= TimeUnit.MINUTES.toMillis(QUIET_STEPS_MINUTES);
+    }
+
+    static boolean shouldRequestHistory(boolean night, boolean unsupported, Boolean bandAsleep,
+            boolean waitingInitial, boolean quiet, boolean cooldownActive, boolean stale) {
+        if (waitingInitial || cooldownActive) return false;
+        if (!unsupported) return !Boolean.TRUE.equals(bandAsleep);
+        if (stale) return false;
+        return !quiet;
+    }
+
+    static boolean nightAwakeConfirmed(boolean night, int awakeSamples) {
+        return !night || awakeSamples >= AWAKE_CONFIRM_SAMPLES;
+    }
+
+    private void updateNightTransition(long nowNanos) {
+        boolean suppressionWindow = isSleepSuppressionWindow();
+        if (suppressionWindow) {
+            advanceQuietTracker();
+            boolean quiet = nightQuietObserved();
+            if (quiet && !quietSignalStale) {
+                if (!nightHadQuiet) {
+                    wakeEvidence.beginEpisode(System.currentTimeMillis());
+                    wakeEvidenceCheckedAtMs = 0;
+                    awakeSamples = 0;
+                }
+                nightHadQuiet = true;
+            } else if (!quiet && nightHadQuiet) {
+                nightHadQuiet = false;
+                // A real step sample ended quiet while still inside the suppression window. This
+                // is an awake sync, so a full history list remains deferred until after 08:00.
+                syncRequested = true;
+                nextHealthAt = nowNanos;
+                io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this,
+                        "HISTORY_SYNC quiet ended wake catch-up");
+            }
+        }
+        if (!suppressionWindow) {
+            resetQuietTracker();
+            wakeEvidence.reset();
+            wakeEvidenceCheckedAtMs = 0;
+            awakeSamples = 0;
+        }
+    }
+
+    /** A daytime session after a night flush gets one full history pass. */
+    private void maybeWakeCatchup(long nowNanos) {
+        int hour = java.time.LocalTime.now().getHour();
+        if (isNightWindow(hour) || lastNightFlushAtMs <= 0) return;
+        long nowMs = System.currentTimeMillis();
+        if (nightStillSuppressed(hour, wakeEvidence(nowMs))) return;
+        if (nowMs < lastNightFlushAtMs) return;
+        try {
+            String deviceId = new BandStateRepository(this).deviceId();
+            if (deviceId.isBlank()) return;
+            String today = java.time.LocalDate.now().toString();
+            String key = WAKE_CATCHUP_DATE + "_" + deviceId;
+            var prefs = getSharedPreferences(LIVE_PREFS, MODE_PRIVATE);
+            if (today.equals(prefs.getString(key, ""))) return;
+            prefs.edit().putString(key, today).apply();
+            syncRequested = true;
+            nextHealthAt = nowNanos;
+            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this,
+                    "HISTORY_SYNC wake catch-up");
+        } catch (RuntimeException ignored) { }
+    }
+
+    private boolean wakeEvidence(long nowMs) {
+        if (wakeEvidence.observed()) return true;
+        if (!sleepStateUnsupported && Boolean.FALSE.equals(bandAsleep)
+                && awakeSamples >= AWAKE_CONFIRM_SAMPLES) {
+            wakeEvidence.observe();
+            return true;
+        }
+        int hour = java.time.LocalTime.now().getHour();
+        if (hour < NIGHT_END_HOUR) return false;
+        if (wakeEvidenceCheckedAtMs > 0 && nowMs - wakeEvidenceCheckedAtMs < 60_000L) return false;
+        wakeEvidenceCheckedAtMs = nowMs;
+        if (bandSleepClosed(nowMs)) wakeEvidence.observe();
+        return wakeEvidence.observed();
+    }
+
+    /** The latest stored sleep interval is closed only when firmware wrote open == 0. */
+    private boolean bandSleepClosed(long nowMs) {
+        try (io.github.miam1ku.mibandoplusbridge.data.HealthRecordStore store =
+                     new io.github.miam1ku.mibandoplusbridge.data.HealthRecordStore(this)) {
+            String deviceId = new BandStateRepository(this).deviceId();
+            if (deviceId.isBlank()) return false;
+            var rows = store.storedRecords(deviceId, "sleep_interval",
+                    nowMs - TimeUnit.HOURS.toMillis(12), nowMs);
+            var latest = rows.stream()
+                    .max(java.util.Comparator.comparingLong(record -> record.endMs))
+                    .orElse(null);
+            return latest != null && latest.complete && wakeEvidence.acceptsClosedInterval(latest.endMs);
+        } catch (Exception unavailable) {
+            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this,
+                    "SLEEP_GATE sleep interval unavailable=" + unavailable.getClass().getSimpleName());
+            return false;
+        }
+    }
+
+    private void persistNightCooldown() {
+        lastNightFlushAtMs = System.currentTimeMillis();
+        try {
+            String deviceId = new BandStateRepository(this).deviceId();
+            if (!deviceId.isBlank()) {
+                getSharedPreferences(LIVE_PREFS, MODE_PRIVATE).edit()
+                        .putLong(lastNightFlushKey(deviceId), lastNightFlushAtMs).apply();
+            }
+        } catch (RuntimeException ignored) { }
+    }
+
+    /** Ends the live-stats stream once; a running stream keeps the band measuring heart rate. */
+    private void stopRealtimeStats() {
+        if (!realtimeStatsStopPending) return;
+        realtimeStatsStopPending = false;
+        var queue = commands;
+        if (queue == null || stopRequested) return;
+        queue.send(realtimeStats(REALTIME_STATS_STOP));
+    }
+
+    static boolean supervisorStalled(boolean running, boolean sessionActive, long beatMs, long nowElapsedMs) {
+        return running && !sessionActive && beatMs != 0L && nowElapsedMs - beatMs > SUPERVISOR_STALL_MS;
+    }
+
+    private void tick() {
+        if (stopRequested) return;
+        var queue = commands;
+        long nowElapsed = android.os.SystemClock.elapsedRealtime();
+        if (queue != null) {
+            supervisorBeatMs = nowElapsed;
+        } else if (supervisorStalled(running.get(), false, supervisorBeatMs, nowElapsed)) {
+            long beatAge = nowElapsed - supervisorBeatMs;
+            // The coordinator survives a process freeze, so it can put the worker back after the
+            // frozen supervisor thread died while disconnected. Re-entry is harmless:
+            // SppDiagnosticClient admits one live session at a time.
+            supervisorBeatMs = nowElapsed;
+            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this,
+                    "supervise stalled " + (beatAge / 1000) + "s, restarting");
+            if (isNightWindow()) {
+                historySyncPending = false;
+                historyDeferredSinceMs = 0;
+                nextHealthAt = System.nanoTime() + TimeUnit.MINUTES.toNanos(NIGHT_RESTART_COOLDOWN_MINUTES);
+                historyCooldownUntilMs = System.currentTimeMillis()
+                        + TimeUnit.MINUTES.toMillis(NIGHT_RESTART_COOLDOWN_MINUTES);
+                persistNightCooldown();
+                io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this,
+                        "HISTORY_SYNC night restart cooldown");
+            }
+            try {
+                worker.execute(this::supervise);
+            } catch (java.util.concurrent.RejectedExecutionException stopping) { }
+        }
+        if (queue == null || historySync == null) return;
+        if (!healthBound) bindHealthHost();
+        if (!new BandStateRepository(this).isRegistered()) {
+            requestStop();
+            return;
+        }
+        long now = System.nanoTime();
+        updateNightTransition(now);
+        if (now >= nextBatteryAt) {
+            nextBatteryAt = now + TimeUnit.MINUTES.toNanos(BATTERY_POLL_MINUTES);
+            queue.request(nodomain.freeyourgadget.gadgetbridge.proto.xiaomi.XiaomiProto.Command
+                    .newBuilder().setType(2).setSubtype(1).build(), 2, 1)
+                    .whenComplete((ignored, error) -> {
+                        if (error != null) writeStatus("BATTERY_REFRESH_FAILED");
+                    });
+        }
+        if (isSleepSuppressionWindow() && running.get() && now >= nextNightStatsAt) {
+            nextNightStatsAt = now + TimeUnit.MINUTES.toNanos(NIGHT_STATS_REFRESH_MINUTES);
+            var statsQueue = commands;
+            if (statsQueue != null && !realtimeStatsStopPending) {
+                statsQueue.send(realtimeStats(REALTIME_STATS_START));
+                realtimeStatsStopPending = true;
+                long epoch = sessionEpoch;
+                coordinator.schedule(() -> {
+                    if (epoch == sessionEpoch) stopRealtimeStats();
+                }, REALTIME_STATS_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            }
+        }
+        if (now >= nextSleepStateAt) {
+            nextSleepStateAt = now + TimeUnit.MINUTES.toNanos(SLEEP_STATE_POLL_MINUTES);
+            // A nap holds pending history the same way a night does, so keep asking until awake.
+            if (shouldPollSleepStateNow()
+                    || (historySyncPending && Boolean.TRUE.equals(bandAsleep))) {
+                requestSleepState(true);
+            }
+        }
+        if (waitingForInitialSleepState && now >= historyStateDeadlineAt) {
+            waitingForInitialSleepState = false;
+            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this,
+                    "HISTORY_SYNC sleep-state timeout, checking pending history");
+        }
+        boolean manualRequested = isManualSyncOverrideActive(manualSyncRequested,
+                manualSyncRequestedAtMs, android.os.SystemClock.elapsedRealtime());
+        if (syncRequested || manualRequested || now >= nextHealthAt) {
+            boolean historical = manualRequested || (syncRequested && !isNightWindow());
+            syncRequested = false;
+            nextHealthAt = now + TimeUnit.MINUTES.toNanos(historyPeriodMinutes());
+            requestHistoryWhenAwake(historical);
+        }
+        // Pending work may become eligible on timeout or when the suppression window ends.
+        flushPendingHistory();
+        if (now >= nextWeatherAt) {
+            nextWeatherAt = now + TimeUnit.MINUTES.toNanos(30);
+            weatherSync.sendIfChanged();
+        }
+        maybeWakeCatchup(now);
+    }
+
+    private static boolean retryable(String code) {
+        if (code.indexOf('_') < 0) return true;
+        return switch (code) {
+            case "BLUETOOTH_DISABLED", "DIAGNOSTIC_TIMEOUT", "CANCELLED", "CONNECTION_ALREADY_ACTIVE",
+                    "USER_LOCKED", "EMPTY_SOCKET_READ", "CLOSED", "CONNECT_TIMEOUT", "BOND_BUSY" -> true;
+            // A missing bond fails before the socket exists, so retrying is cheap and the band
+            // comes back within seconds of whoever restores the bond.
+            case "OFFICIAL_PAIRING_REQUIRED" -> true;
+            // Link loss is not a bad binding. Quiet backoff left the band down for two minutes.
+            default -> code.startsWith("CLOSED") || code.startsWith("BLE_");
+        };
+    }
+
+    /** reason is the hidden unbond extra. 9 means some app removed the bond; 1 means auth failed. */
+    private void noteBond(Context context, Intent intent) {
+        int state = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.ERROR);
+        int previous = intent.getIntExtra(BluetoothDevice.EXTRA_PREVIOUS_BOND_STATE, BluetoothDevice.ERROR);
+        int reason = intent.getIntExtra("android.bluetooth.device.extra.REASON", -1);
+        BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice.class);
+        String ours = "unknown";
+        if (device != null) {
+            try {
+                ours = String.valueOf(new BandStateRepository(context).matchesAddress(device.getAddress()));
+            } catch (RuntimeException locked) { }
+        }
+        io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(context, "bond changed state=" + state
+                + "/" + bondName(state) + " prev=" + previous + "/" + bondName(previous)
+                + " reason=" + reason + "/" + bondReason(reason) + " ours=" + ours);
+        if (state == BluetoothDevice.BOND_NONE && previous == BluetoothDevice.BOND_BONDED) {
+            // One greppable line: the bond a live SPP session needs went away, and this says who
+            // the stack blamed. reason 9 is a local removal; 1 and 8 are the band refusing a key.
+            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(context, "bond lost reason="
+                    + bondReason(reason) + " ours=" + ours);
+        }
+        if (!"true".equals(ours)) return;
+        // A lost or restored bond changes what the next attempt can do. Without this the worker
+        // sat out the whole backoff after someone else re-paired the band.
+        if (bondRecovery.note(state, android.os.SystemClock.elapsedRealtime())) {
+            synchronized (stopLock) {
+                retryNow = true;
+                stopLock.notifyAll();
+            }
+        }
+    }
+
+    /**
+     * The pairing budget has to outlive the process. It used to live only in memory, so clearing
+     * the app from recents handed the bridge a fresh 「ask once」 — and since the bond the band
+     * dropped was still missing, opening the app again asked the wrist to pair again. Every time.
+     */
+    private void restoreBondBudget() {
+        try {
+            android.content.SharedPreferences prefs = getSharedPreferences(BOND_PREFS, MODE_PRIVATE);
+            int asks = prefs.getInt("asks", 0);
+            if (asks <= 0) return;
+            long lastAskMs = prefs.getLong("lastAskMs", Long.MIN_VALUE);
+            // elapsedRealtime restarts at boot, so a stored value in the future means the phone
+            // rebooted: keep the spent budget and start its half hour window from now.
+            long now = android.os.SystemClock.elapsedRealtime();
+            if (lastAskMs == Long.MIN_VALUE || lastAskMs > now) lastAskMs = now;
+            bondRecovery.restore(asks, lastAskMs);
+        } catch (RuntimeException ignored) { }
+    }
+
+    private void persistBondBudget() {
+        try {
+            getSharedPreferences(BOND_PREFS, MODE_PRIVATE).edit()
+                    .putInt("asks", bondRecovery.asks())
+                    .putLong("lastAskMs", bondRecovery.lastAskMs())
+                    .apply();
+        } catch (RuntimeException ignored) { }
+    }
+
+    /**
+     * SPP opens a secure RFCOMM socket and needs the system bond. ColourOS and Mi Fitness remove
+     * that bond while the bridge owns the band, and the quiet retry then waited for a repair that
+     * only the official app could start. Ask for the bond here instead, a bounded number of times.
+     */
+    private void repairBond() {
+        String address;
+        try {
+            address = new BandStateRepository(this).address();
+        } catch (RuntimeException locked) {
+            return;
+        }
+        if (address == null || address.isBlank()) return;
+        var adapter = getSystemService(android.bluetooth.BluetoothManager.class).getAdapter();
+        if (adapter == null || !adapter.isEnabled()) return;
+        BluetoothDevice device;
+        try {
+            device = adapter.getRemoteDevice(address);
+        } catch (IllegalArgumentException invalid) {
+            return;
+        }
+        long now = android.os.SystemClock.elapsedRealtime();
+        int state;
+        try {
+            state = device.getBondState();
+        } catch (SecurityException denied) {
+            return;
+        }
+        int action = bondRecovery.decide(state, now);
+        if (action == BondRecovery.READY) {
+            bondGaveUpLogged = false;
+            return;
+        }
+        if (action == BondRecovery.GAVE_UP) {
+            if (!bondGaveUpLogged) {
+                bondGaveUpLogged = true;
+                io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this,
+                        "bond repair gave-up asks=" + bondRecovery.asks() + " state=" + state);
+            }
+            return;
+        }
+        if (action != BondRecovery.ASK) return;
+        boolean started;
+        try {
+            started = device.createBond();
+        } catch (SecurityException denied) {
+            started = false;
+        }
+        bondRecovery.asked(now);
+        persistBondBudget();
+        bondGaveUpLogged = false;
+        io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this,
+                "bond repair ask=" + bondRecovery.asks() + " state=" + state + " started=" + started);
+    }
+
+    private String statusCopy(String status) {
+        if ("OFFICIAL_PAIRING_REQUIRED".equals(status)) {
+            boolean gaveUp = bondRecovery.gaveUp();
+            bondRepairOffered = gaveUp;
+            return BondRecovery.notice(gaveUp);
+        }
+        bondRepairOffered = false;
+        return retryable(status) ? "正在重连" : "稍后自动重连";
+    }
+
+    private static String adapterState(int state) {
+        return switch (state) {
+            case BluetoothAdapter.STATE_OFF -> "off";
+            case BluetoothAdapter.STATE_TURNING_ON -> "turning-on";
+            case BluetoothAdapter.STATE_ON -> "on";
+            case BluetoothAdapter.STATE_TURNING_OFF -> "turning-off";
+            default -> "other";
+        };
+    }
+
+    private static String bondName(int state) {
+        return switch (state) {
+            case BluetoothDevice.BOND_NONE -> "none";
+            case BluetoothDevice.BOND_BONDING -> "bonding";
+            case BluetoothDevice.BOND_BONDED -> "bonded";
+            default -> "other";
+        };
+    }
+
+    private static String bondReason(int reason) {
+        return switch (reason) {
+            case -1 -> "absent";
+            case 1 -> "auth-failed";
+            case 2 -> "auth-rejected";
+            case 3 -> "auth-canceled";
+            case 4 -> "remote-down";
+            case 5 -> "discovery";
+            case 6 -> "auth-timeout";
+            case 7 -> "repeated";
+            case 8 -> "remote-auth-canceled";
+            case 9 -> "removed";
+            default -> "other";
+        };
+    }
+
+    private boolean waitForRetry(long delayMs) {
+        long end = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(delayMs);
+        synchronized (stopLock) {
+            while (!stopRequested && !retryNow) {
+                long leftMs = TimeUnit.NANOSECONDS.toMillis(end - System.nanoTime());
+                if (leftMs <= 0) return true;
+                try {
+                    stopLock.wait(leftMs);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+            }
+            if (stopRequested) return false;
+            retryNow = false;
+            return true;
+        }
+    }
+
+    private void writeStatus(String status) {
+        try (FileWriter writer = new FileWriter(new File(getNoBackupFilesDir(), "live-status.txt"))) {
+            writer.write(status);
+        } catch (IOException ignored) { }
+    }
+
+    /**
+     * Publishes connected=false once the reopen window has passed. The write itself is unchanged and
+     * still immediate when the user asked for the stop: this only hides a loss the worker is about
+     * to repair, which is every close of a five minute session.
+     */
+    private void scheduleOfflineGrace(String status) {
+        cancelOfflineGrace();
+        Runnable check = () -> {
+            offlineGrace = null;
+            if (stopRequested) return;
+            try { new BandStateRepository(this).markSessionClosed(); } catch (RuntimeException ignored) { }
+            show(statusCopy(status));
+        };
+        offlineGrace = check;
+        main.postDelayed(check, OFFLINE_GRACE_MS);
+    }
+
+    /** A session that authenticated again owns the published state; the pending flip is stale. */
+    private void cancelOfflineGrace() {
+        Runnable pending = offlineGrace;
+        if (pending == null) return;
+        offlineGrace = null;
+        main.removeCallbacks(pending);
+    }
+
+    private void syncDnd() {
+        var queue = commands;
+        if (stopRequested || queue == null) return;
+        int filter = io.github.miam1ku.mibandoplusbridge.notify.PhoneDnd.currentFilter(this);
+        long now = System.nanoTime();
+        synchronized (dndSyncLock) {
+            long elapsed = dndSyncAtNanos == 0 ? -1 : now - dndSyncAtNanos;
+            boolean phoneChanged = lastDndFilter != Integer.MIN_VALUE && lastDndFilter != filter;
+            if (io.github.miam1ku.mibandoplusbridge.notify.PhoneDnd.repeatSync(lastDndFilter, elapsed, filter)) {
+                return;
+            }
+            dndPushPhone = phoneChanged;
+            lastDndFilter = filter;
+            dndSyncAtNanos = now;
+        }
+        String detail = io.github.miam1ku.mibandoplusbridge.notify.PhoneDnd.describe(this);
+        android.util.Log.i("OplusBandBridge", "DND_SYNC " + detail);
+        io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this, "DND_SYNC " + detail);
+        switch (dndSync.before()) {
+            case ASK -> askDndSync(queue);
+            case MIRROR -> mirrorDnd(queue);
+            case HOLD -> {
+                io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this, "DND_SYNC_HOLD bandSync=off");
+                android.util.Log.i("OplusBandBridge", "DND_SYNC_HOLD bandSync=off");
+            }
+        }
+    }
+
+    /**
+     * A session starts by reading the band's own 同步手机勿扰 switch. Subtype 15 with enabled 1 is
+     * this phone turning that switch on, so it must not go out before the answer is known: the
+     * user turned it off on the band, and a plain reconnect used to switch it back on.
+     */
+    private void askDndSync(io.github.miam1ku.mibandoplusbridge.protocol.LiveCommandQueue queue) {
+        sendQuietly(queue, io.github.miam1ku.mibandoplusbridge.protocol.BandDndCommand.querySync());
+        main.removeCallbacks(dndAskFallback);
+        main.postDelayed(dndAskFallback, DND_ASK_FALLBACK_MS);
+    }
+
+    /** Firmware that ignores subtype 14 keeps the stored switch value and gets the mirror anyway. */
+    private void dndAskTimedOut() {
+        if (!dndSync.waiting()) return;
+        io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this, "DND_SYNC_SWITCH quiet");
+        var queue = commands;
+        if (dndSync.answered(null) && queue != null && !stopRequested) mirrorDnd(queue);
+    }
+
+    /** Subtype 15 with enabled 1 both keeps the phone rule and leaves the switch on. */
+    private void mirrorDnd(io.github.miam1ku.mibandoplusbridge.protocol.LiveCommandQueue queue) {
+        if (!dndSync.on() || stopRequested) return;
+        // The band drops a rule list that arrives before sync_with_phone is on.
+        // Transport ACK is earlier than that; wait for the subtype 15 body.
+        queue.request(io.github.miam1ku.mibandoplusbridge.protocol.BandDndCommand.syncWithPhone(), 2, 15)
+                .whenComplete((done, error) -> {
+                    if (error != null) {
+                        android.util.Log.i("OplusBandBridge", "DND_SYNC_REJECTED subtype=15");
+                    }
+                    sendDndFollowup();
+                });
+    }
+
+    /** The band's switch, either answering subtype 14 or pushed after the user moved it on the band. */
+    private void noteBandDndSync(nodomain.freeyourgadget.gadgetbridge.proto.xiaomi.XiaomiProto.Command command) {
+        Boolean enabled = io.github.miam1ku.mibandoplusbridge.protocol.BandDndCommand.syncEnabled(command);
+        if (enabled == null) return;
+        boolean mirror = dndSync.answered(enabled);
+        rememberDndSync(dndSync.on());
+        main.removeCallbacks(dndAskFallback);
+        io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this, "DND_SYNC_SWITCH bandSync="
+                + (dndSync.on() ? "on" : "off") + " mirror=" + mirror);
+        if (!dndSync.on()) {
+            // Nothing may reach the band again until the switch is back on there.
+            main.removeCallbacks(dndRulesAgain);
+            return;
+        }
+        if (!mirror) return;
+        var queue = commands;
+        if (queue == null || stopRequested) return;
+        main.post(() -> { if (!stopRequested && commands == queue) mirrorDnd(queue); });
+    }
+
+    /** The band's 同步手机勿扰 switch as this app last recorded it. Lab screens read it too. */
+    public static boolean bandSyncEnabled(Context context) {
+        return !io.github.miam1ku.mibandoplusbridge.data.LocalPrefs.open(context, FEATURES)
+                .getBoolean(DND_SYNC_OFF_KEY, false);
+    }
+
+    private void rememberDndSync(boolean enabled) {
+        if (dndSyncStored != null && dndSyncStored == enabled) return;
+        dndSyncStored = enabled;
+        try {
+            io.github.miam1ku.mibandoplusbridge.data.LocalPrefs.open(this, FEATURES)
+                    .edit().putBoolean(DND_SYNC_OFF_KEY, !enabled).commit();
+        } catch (RuntimeException ignored) { }
+    }
+
+    private void sendDndFollowup() {
+        pushDndState(false);
+    }
+
+    private void pushDndState(boolean resend) {
+        var queue = commands;
+        if (stopRequested || queue == null) return;
+        if (!dndSync.on()) {
+            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this, "DND_SYNC_HOLD bandSync=off push");
+            return;
+        }
+        boolean phoneOn = io.github.miam1ku.mibandoplusbridge.notify.PhoneDnd.blocksNotifications(
+                io.github.miam1ku.mibandoplusbridge.notify.PhoneDnd.currentFilter(this));
+        if (!io.github.miam1ku.mibandoplusbridge.notify.PhoneDnd.sendPhoneRule(
+                dndPushPhone, phoneOn, dndBandKnown, dndBandOn)) {
+            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this, "DND_HOLD phone=" + phoneOn
+                    + " changed=" + dndPushPhone + " bandKnown=" + dndBandKnown + " band=" + dndBandOn);
+            if (!resend) sendQuietly(queue, io.github.miam1ku.mibandoplusbridge.protocol.BandDndCommand.queryRules());
+            return;
+        }
+        lastDndSentNanos = System.nanoTime();
+        int activatedAt = io.github.miam1ku.mibandoplusbridge.protocol.BandDndCommand.activatedAt(
+                System.currentTimeMillis());
+        sendQuietly(queue, io.github.miam1ku.mibandoplusbridge.protocol.BandDndCommand.state(phoneOn));
+        sendQuietly(queue, io.github.miam1ku.mibandoplusbridge.protocol.BandDndCommand.phoneSilent(phoneOn));
+        sendQuietly(queue, io.github.miam1ku.mibandoplusbridge.protocol.BandDndCommand.phoneRules(phoneOn, activatedAt));
+        if (resend) {
+            sendQuietly(queue, io.github.miam1ku.mibandoplusbridge.protocol.BandDndCommand.queryRules());
+            return;
+        }
+        sendQuietly(queue, io.github.miam1ku.mibandoplusbridge.protocol.BandDndCommand.queryRules());
+        main.removeCallbacks(dndRulesAgain);
+        main.postDelayed(dndRulesAgain, 2000);
+    }
+
+    private void replyMusic() {
+        var queue = commands;
+        if (stopRequested || queue == null) return;
+        var command = lastMusic;
+        if (command == null) {
+            android.media.AudioManager audio = getSystemService(android.media.AudioManager.class);
+            int volume = 0;
+            if (audio != null) {
+                int max = audio.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC);
+                volume = io.github.miam1ku.mibandoplusbridge.protocol.BandMusicCommand.percent(
+                        audio.getStreamVolume(android.media.AudioManager.STREAM_MUSIC), max);
+            }
+            command = io.github.miam1ku.mibandoplusbridge.protocol.BandMusicCommand.nothing(volume);
+        }
+        var info = command.getMusic().getMusicInfo();
+        io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this, "MUSIC_REPLY state="
+                + info.getState() + " volume=" + info.getVolume());
+        sendQuietly(queue, command);
+    }
+
+    private void replySilent() {
+        var queue = commands;
+        if (stopRequested || queue == null) return;
+        boolean on = io.github.miam1ku.mibandoplusbridge.notify.PhoneDnd.blocksNotifications(
+                io.github.miam1ku.mibandoplusbridge.notify.PhoneDnd.currentFilter(this));
+        io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this, "SILENT_REQ on=" + on);
+        sendQuietly(queue, io.github.miam1ku.mibandoplusbridge.protocol.BandDndCommand.phoneSilent(on));
+    }
+
+
+    private void applyBandManual(nodomain.freeyourgadget.gadgetbridge.proto.xiaomi.XiaomiProto.Command command) {
+        // With the band's switch off the two sides are independent, in both directions.
+        if (!dndSync.on()) return;
+        Boolean bandOn = io.github.miam1ku.mibandoplusbridge.protocol.BandDndCommand.pushedManualState(command);
+        if (bandOn == null) return;
+        if (!io.github.miam1ku.mibandoplusbridge.notify.PhoneDnd.acceptBandManual(
+                bandOn, io.github.miam1ku.mibandoplusbridge.notify.PhoneDnd.currentFilter(this),
+                lastDndSentNanos, System.nanoTime())) return;
+        requestPhoneDnd(bandOn);
+    }
+
+    private void requestPhoneDnd(boolean on) {
+        main.post(() -> {
+            if (!io.github.miam1ku.mibandoplusbridge.notify.PhoneDnd.acceptBandManual(
+                    on, io.github.miam1ku.mibandoplusbridge.notify.PhoneDnd.currentFilter(this),
+                    lastDndSentNanos, System.nanoTime())) return;
+            var attempt = io.github.miam1ku.mibandoplusbridge.notify.PhoneDnd.apply(this, on);
+            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this, "DND_FROM_BAND on=" + on
+                    + " applied=" + attempt.applied() + " policy=" + attempt.policy()
+                    + " via=" + attempt.via());
+            if (attempt.applied()) return;
+            Intent intent = new Intent(io.github.miam1ku.mibandoplusbridge.hook.OHealthDndHook.ACTION)
+                    .setPackage("com.heytap.health")
+                    .putExtra("on", on);
+            sendOrderedBroadcast(intent, null, new BroadcastReceiver() {
+                @Override public void onReceive(Context context, Intent done) {
+                    boolean applied = getResultCode() == 1;
+                    io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(BandLiveService.this,
+                            "DND_FROM_BAND_HOST on=" + on + " applied=" + applied
+                                    + " via=" + getResultData());
+                    if (!applied) askRootZen(on);
+                }
+            }, main, 0, null, null);
+        });
+    }
+
+    private void askRootZen(boolean on) {
+        HostKeepAlive.runRoot(() -> {
+            boolean wrote = OwnershipController.setZenMode(on);
+            boolean applied = wrote && io.github.miam1ku.mibandoplusbridge.notify.PhoneDnd.blocksNotifications(
+                    io.github.miam1ku.mibandoplusbridge.notify.PhoneDnd.currentFilter(this)) == on;
+            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this, "DND_FROM_BAND_ROOT on=" + on
+                    + " wrote=" + wrote + " applied=" + applied);
+        });
+    }
+
+    private boolean historyMayRun() {
+        int hour = java.time.LocalTime.now().getHour();
+        long nowMs = System.currentTimeMillis();
+        boolean evidence = wakeEvidence(nowMs);
+        if (nightStillSuppressed(hour, evidence)) return false;
+        boolean night = isNightWindow(hour);
+        boolean cooldown = night && nowMs < historyCooldownUntilMs;
+        boolean quiet = sleepStateUnsupported && !waitingForInitialSleepState
+                && !cooldown && !evidence && nightQuietObserved();
+        boolean stale = quietSignalStale && !evidence;
+        Boolean gatedSleepState = evidence || napCapReached(isSleepProtectionWindow(hour),
+                historyDeferredSinceMs, nowMs) ? Boolean.FALSE : bandAsleep;
+        return shouldRequestHistory(night, sleepStateUnsupported, gatedSleepState,
+                waitingForInitialSleepState, quiet, cooldown, stale);
+    }
+
+    /**
+     * History pulls make the band close an open sleep file (firmware logs "Force wk-5"), at any
+     * hour, so a daytime nap is gated by the band's own state just like a night. Outside the
+     * night hold a band that keeps reporting asleep is trusted for {@link #DAY_ASLEEP_DEFER_HOURS}.
+     */
+    static boolean napCapReached(boolean suppressionWindow, long deferredSinceMs, long nowMs) {
+        return !suppressionWindow && deferredSinceMs > 0
+                && nowMs - deferredSinceMs >= TimeUnit.HOURS.toMillis(DAY_ASLEEP_DEFER_HOURS);
+    }
+
+    static boolean sleepStateFresh(long nowMs, long reportedAtMs) {
+        return reportedAtMs > 0 && nowMs >= reportedAtMs
+                && nowMs - reportedAtMs <= TimeUnit.MINUTES.toMillis(SLEEP_STATE_FRESH_MINUTES);
+    }
+
+    private boolean sleepStateFresh(long nowMs) {
+        return sleepStateFresh(nowMs, bandAsleepAtMs);
+    }
+
+    /** Asks the band before pulling history; the reply or the timeout resumes the pending pull. */
+    private boolean checkSleepStateBeforeHistory() {
+        if (sleepStateUnsupported || waitingForInitialSleepState || commands == null
+                || sleepStateFresh(System.currentTimeMillis())) {
+            return false;
+        }
+        waitingForInitialSleepState = true;
+        historyStateDeadlineAt = System.nanoTime()
+                + TimeUnit.SECONDS.toNanos(INITIAL_HISTORY_SYNC_WAIT_SECONDS);
+        requestSleepState(true);
+        return true;
+    }
+
+    private void requestHistoryWhenAwake(boolean historical) {
+        pendingHistoryIncludesHistory |= historical && !isNightWindow();
+        boolean manualRequested = isManualSyncOverrideActive(manualSyncRequested,
+                manualSyncRequestedAtMs, android.os.SystemClock.elapsedRealtime());
+        if (manualRequested) pendingHistoryIncludesHistory = true;
+        historySyncPending = true;
+        if (historyDeferredSinceMs == 0) historyDeferredSinceMs = System.currentTimeMillis();
+        if (!manualRequested && checkSleepStateBeforeHistory()) return;
+        if (!manualRequested && !historyMayRun()) {
+            healthCollectionStatus("HISTORY_SYNC_QUEUED");
+            String line = "HISTORY_SYNC deferred reason=" + historyDeferReason()
+                    + " asleep=" + bandAsleep
+                    + " waiting=" + waitingForInitialSleepState
+                    + " quiet=" + (sleepStateUnsupported && nightQuietObserved());
+            // Health pulls and ticks repeat the same verdict many times a minute.
+            if (!line.equals(lastHistoryDeferLine)) {
+                lastHistoryDeferLine = line;
+                io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this, line);
+            }
+            return;
+        }
+        flushPendingHistory();
+    }
+
+    /** Mirrors {@link #historyMayRun()} so a deferred line names the gate that held it. */
+    private String historyDeferReason() {
+        int hour = java.time.LocalTime.now().getHour();
+        long nowMs = System.currentTimeMillis();
+        boolean evidence = wakeEvidence.observed();
+        if (nightStillSuppressed(hour, evidence)) {
+            return isNightWindow(hour) ? "night" : "late-hold-no-wake-evidence";
+        }
+        if (waitingForInitialSleepState) return "waiting-sleep-state";
+        if (isNightWindow(hour) && nowMs < historyCooldownUntilMs) return "cooldown";
+        if (!sleepStateUnsupported) return isSleepProtectionWindow(hour) ? "band-asleep" : "band-asleep-nap";
+        if (quietSignalStale && !evidence) return "steps-stale";
+        return "quiet";
+    }
+
+    private void flushPendingHistory() {
+        if (!historySyncPending) return;
+        boolean manualOverride = consumeManualSync(manualSyncRequested, historySync != null,
+                manualSyncRequestedAtMs, android.os.SystemClock.elapsedRealtime());
+        if (historySync == null) return;
+        if (!historyShouldFlush(true, manualOverride, historyMayRun())) return;
+        boolean historical = pendingHistoryIncludesHistory && (manualOverride || !isNightWindow());
+        historySyncPending = false;
+        historyDeferredSinceMs = 0;
+        lastHistoryDeferLine = null;
+        pendingHistoryIncludesHistory = false;
+        healthCollectionStatus("HISTORY_SYNCING");
+        historySync.request(historical);
+        if (isNightWindow()) {
+            nightHadQuiet |= nightQuietObserved();
+            persistNightCooldown();
+        }
+        io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this,
+                "HISTORY_SYNC resume includesHistory=" + historical);
+        if (historical) {
+            bindHealthHost();
+            nextWeatherAt = System.nanoTime() + TimeUnit.MINUTES.toNanos(30);
+            weatherSync.refreshAndSend();
+        }
+    }
+
+    /** Read-only: a tick checks this several times, so expiry must not clear the request. */
+    static boolean isManualSyncOverrideActive(AtomicBoolean requested, long requestedAtMs, long nowMs) {
+        return requested.get() && overrideWithinTtl(requestedAtMs, nowMs);
+    }
+
+    private static boolean overrideWithinTtl(long requestedAtMs, long nowMs) {
+        return requestedAtMs > 0 && nowMs >= requestedAtMs
+                && nowMs - requestedAtMs <= MANUAL_SYNC_OVERRIDE_TTL_MS;
+    }
+
+    static boolean consumeManualSync(AtomicBoolean requested, boolean historyReady,
+            long requestedAtMs, long nowMs) {
+        if (!historyReady) return false;
+        if (!requested.compareAndSet(true, false)) return false;
+        // Expired requests still get cleared here so a stale flag cannot outlive its round.
+        return overrideWithinTtl(requestedAtMs, nowMs);
+    }
+
+    static boolean historyShouldFlush(boolean pending, boolean manualOverride, boolean mayRun) {
+        return pending && (manualOverride || mayRun);
+    }
+
+    private void requestSleepState() {
+        requestSleepState(false);
+    }
+
+    private void requestSleepState(boolean beforeHistory) {
+        var queue = commands;
+        if (sleepStateUnsupported || stopRequested || queue == null
+                || !(beforeHistory || shouldPollSleepStateNow())) {
+            return;
+        }
+        long epoch = sessionEpoch;
+        queue.request(io.github.miam1ku.mibandoplusbridge.notify.SleepMusic.query(), 2, 78).exceptionally(error -> {
+            coordinator.execute(() -> {
+                if (epoch == sessionEpoch && !stopRequested) noteSleepStateMiss();
+            });
+            return null;
+        });
+    }
+
+    @androidx.annotation.WorkerThread
+    private void noteSleep(nodomain.freeyourgadget.gadgetbridge.proto.xiaomi.XiaomiProto.Command command) {
+        Boolean asleep = io.github.miam1ku.mibandoplusbridge.notify.SleepMusic.asleep(command);
+        if (asleep == null) return;
+        sleepStateMisses = 0;
+        if (sleepStateUnsupported) {
+            sleepStateUnsupported = false;
+            persistSleepStateUnsupported(false);
+        }
+        boolean changed = !asleep.equals(bandAsleep);
+        bandAsleep = asleep;
+        bandAsleepAtMs = System.currentTimeMillis();
+        waitingForInitialSleepState = false;
+        historyStateDeadlineAt = 0;
+        if (changed && historySyncPending) {
+            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this,
+                    "HISTORY_SYNC sleep state=" + (asleep ? "SLEEPING" : "AWAKE")
+                            + " pending=" + historySyncPending);
+        }
+        if (asleep) {
+            if (changed) {
+                wakeEvidence.beginEpisode(System.currentTimeMillis());
+                wakeEvidenceCheckedAtMs = 0;
+            }
+            awakeSamples = 0;
+        } else {
+            awakeSamples++;
+            if (historySyncPending && awakeSamples < AWAKE_CONFIRM_SAMPLES
+                    && !isNightWindow() && isSleepSuppressionWindow()) {
+                nextSleepStateAt = Math.min(nextSleepStateAt,
+                        System.nanoTime() + TimeUnit.SECONDS.toNanos(LATE_AWAKE_CONFIRM_SECONDS));
+            }
+            if (nightAwakeConfirmed(isNightWindow(), awakeSamples)) {
+                flushPendingHistory();
+            } else {
+                io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this,
+                        "SLEEP_STATE awake streak=" + awakeSamples + " (deferred)");
+            }
+        }
+        if (!sleepPauseOn) return;
+        long now = System.currentTimeMillis();
+        var report = command.getSubtype() == 79 ? sleepMusic.push(asleep, now) : sleepMusic.observe(asleep, now);
+        if ((report.effect() == io.github.miam1ku.mibandoplusbridge.notify.SleepMusic.Effect.BASELINE && asleep)
+                || report.effect() == io.github.miam1ku.mibandoplusbridge.notify.SleepMusic.Effect.WOKE) {
+            if (io.github.miam1ku.mibandoplusbridge.notify.SleepMusic.rememberCutoff(this, now)) {
+                sleepArmedAtMs = Math.max(sleepArmedAtMs, now);
+            }
+        }
+        applySleep(report, switch (report.effect()) {
+            case PAUSE -> "SLEEP_MUSIC pause";
+            case BASELINE -> "SLEEP_MUSIC baseline asleep=" + asleep;
+            case WOKE -> "SLEEP_MUSIC awake";
+            case UNCHANGED -> null;
+        });
+    }
+
+    private void noteSleepFile(java.util.List<io.github.miam1ku.mibandoplusbridge.protocol.BandHistoryParser.Measurement> measurements) {
+        if (!sleepPauseOn || measurements == null) return;
+        long now = System.currentTimeMillis();
+        for (var measurement : measurements) {
+            if (!"sleep_interval".equals(measurement.kind)) continue;
+            var report = sleepMusic.currentNight(measurement.startMs, measurement.endMs, sleepArmedAtMs, now);
+            if (report.effect() != io.github.miam1ku.mibandoplusbridge.notify.SleepMusic.Effect.PAUSE) continue;
+            applySleep(report, "SLEEP_MUSIC pause file");
+        }
+    }
+
+    private void applySleep(io.github.miam1ku.mibandoplusbridge.notify.SleepMusic.Report report, String line) {
+        if (line == null) return;
+        io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this, line);
+        android.util.Log.i("OplusBandBridge", line);
+        if (report.effect() != io.github.miam1ku.mibandoplusbridge.notify.SleepMusic.Effect.PAUSE) return;
+        int generation = report.generation();
+        main.post(() -> {
+            if (!sleepPauseOn || sleepMusic.generation() != generation) return;
+            io.github.miam1ku.mibandoplusbridge.notify.NativeMusic.pause(this);
+        });
+    }
+
+    private void sendDndRulesAgain() {
+        pushDndState(true);
+    }
+
+    private void noteBandRules(nodomain.freeyourgadget.gadgetbridge.proto.xiaomi.XiaomiProto.Command command) {
+        Boolean on = io.github.miam1ku.mibandoplusbridge.protocol.BandDndCommand.manualState(command);
+        if (on == null) return;
+        dndBandKnown = true;
+        dndBandOn = on;
+    }
+
+    private void adoptStoredBand() {
+        if (!dndSync.on() || dndPushPhone || !dndBandKnown) return;
+        boolean phoneOn = io.github.miam1ku.mibandoplusbridge.notify.PhoneDnd.blocksNotifications(
+                io.github.miam1ku.mibandoplusbridge.notify.PhoneDnd.currentFilter(this));
+        if (dndBandOn == phoneOn || !dndAdopted.compareAndSet(false, true)) return;
+        requestPhoneDnd(dndBandOn);
+    }
+
+    private static void sendQuietly(
+            io.github.miam1ku.mibandoplusbridge.protocol.LiveCommandQueue queue,
+            nodomain.freeyourgadget.gadgetbridge.proto.xiaomi.XiaomiProto.Command command) {
+        int subtype = command.getSubtype();
+        queue.send(command).exceptionally(error -> {
+            android.util.Log.i("OplusBandBridge", "DND_SYNC_REJECTED subtype=" + subtype);
+            return null;
+        });
+    }
+
+    private static String describeSystem(
+            nodomain.freeyourgadget.gadgetbridge.proto.xiaomi.XiaomiProto.Command command) {
+        byte[] raw = command.toByteArray();
+        StringBuilder hex = new StringBuilder(Math.min(raw.length, 120) * 2);
+        int shown = Math.min(raw.length, 120);
+        for (int i = 0; i < shown; i++) {
+            hex.append(Character.forDigit((raw[i] >> 4) & 0xf, 16))
+                    .append(Character.forDigit(raw[i] & 0xf, 16));
+        }
+        StringBuilder rules = new StringBuilder();
+        if (command.hasSystem() && command.getSystem().hasPhoneZenRules()) {
+            var list = command.getSystem().getPhoneZenRules().getRuleList();
+            rules.append(" rules=").append(list.size());
+            for (var rule : list) {
+                rules.append(" {").append(rule.getName()).append(" manual=").append(rule.getManual())
+                        .append(" state=").append(rule.getState()).append('}');
+            }
+        }
+        return "rx type=2 subtype=" + command.getSubtype() + " status=" + command.getStatus()
+                + " bytes=" + raw.length + rules + " hex=" + hex;
+    }
+
+    private void show(String title) {
+        NotificationManager manager = getSystemService(NotificationManager.class);
+        NotificationChannel channel = new NotificationChannel(CHANNEL, "手环连接", NotificationManager.IMPORTANCE_LOW);
+        channel.setShowBadge(false);
+        manager.createNotificationChannel(channel);
+        Notification.Builder notice = new Notification.Builder(this, CHANNEL)
+                .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+                .setContentTitle(title)
+                .setOnlyAlertOnce(true)
+                .setOngoing(true);
+        // One shot: the action rides only on the notice that statusCopy just produced.
+        boolean offered = bondRepairOffered;
+        bondRepairOffered = false;
+        if (offered) {
+            Intent repair = new Intent(this, BandLiveService.class).setAction(ACTION_REPAIR);
+            notice.addAction(new Notification.Action.Builder(null, "重新配对",
+                    android.app.PendingIntent.getService(this, 0, repair,
+                            android.app.PendingIntent.FLAG_IMMUTABLE | android.app.PendingIntent.FLAG_UPDATE_CURRENT))
+                    .build());
+        }
+        Notification built = notice.build();
+        synchronized (this) {
+            if (title.equals(noticeTitle) && offered == bondRepairShown) return;
+            startForeground(NOTICE, built, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE);
+            noticeTitle = title;
+            bondRepairShown = offered;
+        }
+    }
+
+    private static void noteIconPackage(nodomain.freeyourgadget.gadgetbridge.proto.xiaomi.XiaomiProto.Command command) {
+        BandLiveService live = instance;
+        if (live == null || command.getType() != 7 || command.getSubtype() != 0
+                || !command.hasNotification() || !command.getNotification().hasNotification2()
+                || !command.getNotification().getNotification2().hasNotification3()) return;
+        String pkg = command.getNotification().getNotification2().getNotification3().getPackage();
+        if (pkg == null || pkg.isBlank() || "phone".equals(pkg)) return;
+        synchronized (live.iconPackages) {
+            live.iconPackages.remove(pkg);
+            live.iconPackages.addLast(pkg);
+            while (live.iconPackages.size() > 32) live.iconPackages.removeFirst();
+        }
+    }
+
+    private void offerIcon(String queried) {
+        String pkg = resolveIconPackage(queried);
+        if (!io.github.miam1ku.mibandoplusbridge.notify.NotificationIcons.available(this, pkg)) {
+            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this, "ICON_SKIP pkg=" + pkg);
+            return;
+        }
+        iconPackage = pkg;
+        sendSessionCommand(io.github.miam1ku.mibandoplusbridge.protocol.BandNotificationCommand.iconQueryReply(pkg));
+        io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this, "ICON_QUERY pkg=" + pkg);
+    }
+
+    private String resolveIconPackage(String queried) {
+        if (queried == null || queried.isBlank()) return "";
+        synchronized (iconPackages) {
+            for (String full : iconPackages) if (full.startsWith(queried)) return full;
+        }
+        return queried;
+    }
+
+    private void uploadIcon(SppDiagnosticClient active,
+            nodomain.freeyourgadget.gadgetbridge.proto.xiaomi.XiaomiProto.NotificationIconRequest request) {
+        if (request.getStatus() != 0) return;
+        String pkg = iconPackage;
+        int size = request.getSize();
+        int format = request.getPixelFormat();
+        if (pkg == null || pkg.isBlank() || !iconUploadBusy.compareAndSet(false, true)) {
+            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this, "ICON_BUSY");
+            return;
+        }
+        coordinator.execute(() -> {
+            try {
+                int[] pixels = io.github.miam1ku.mibandoplusbridge.notify.NotificationIcons.argb(this, pkg, size);
+                byte[] encoded = io.github.miam1ku.mibandoplusbridge.protocol.NotificationIconPixels
+                        .encode(pixels, size, size, format);
+                var queue = commands;
+                if (queue == null || client != active) {
+                    iconUploadBusy.set(false);
+                    return;
+                }
+                queue.request(io.github.miam1ku.mibandoplusbridge.protocol.NotificationIconUpload.request(encoded),
+                        22, 0).whenComplete((ack, error) -> deliverIcon(active, encoded, ack, error));
+            } catch (RuntimeException failure) {
+                iconUploadBusy.set(false);
+                io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this,
+                        "ICON_ENCODE " + failure.getClass().getSimpleName());
+            }
+        });
+    }
+
+    private void deliverIcon(SppDiagnosticClient active, byte[] encoded,
+            nodomain.freeyourgadget.gadgetbridge.proto.xiaomi.XiaomiProto.Command ack, Throwable error) {
+        try {
+            if (error != null || client != active) {
+                iconUploadBusy.set(false);
+                io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this, "ICON_UPLOAD_FAILED");
+                return;
+            }
+            int chunk = io.github.miam1ku.mibandoplusbridge.protocol.NotificationIconUpload
+                    .acceptedChunk(ack, active.notificationPayloadLimit());
+            var parts = io.github.miam1ku.mibandoplusbridge.protocol.NotificationIconUpload
+                    .chunks(io.github.miam1ku.mibandoplusbridge.protocol.NotificationIconUpload.envelope(encoded), chunk);
+            sendIconPart(active, parts, 0);
+        } catch (RuntimeException failure) {
+            iconUploadBusy.set(false);
+            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this, "ICON_UPLOAD_FAILED");
+        }
+    }
+
+    private void sendIconPart(SppDiagnosticClient active, java.util.List<byte[]> parts, int index) {
+        if (client != active) {
+            iconUploadBusy.set(false);
+            return;
+        }
+        if (index >= parts.size()) {
+            iconUploadBusy.set(false);
+            io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this, "ICON_UPLOAD parts=" + parts.size());
+            return;
+        }
+        active.sendDataChunk(parts.get(index)).whenComplete((ignored, error) -> {
+            if (error != null) {
+                iconUploadBusy.set(false);
+                io.github.miam1ku.mibandoplusbridge.data.SessionLog.line(this, "ICON_UPLOAD_FAILED part=" + index);
+                return;
+            }
+            sendIconPart(active, parts, index + 1);
+        });
+    }
+
+    @Override public void onDestroy() {
+        if (instance == this) instance = null;
+        pendingManualSyncAtMs = 0;
+        manualSyncRequested.set(false);
+        manualSyncRequestedAtMs = 0;
+        clearTransientCollectionStatus();
+        unbindHealthHost();
+        if (receiverRegistered) {
+            unregisterReceiver(bluetoothEvents);
+            receiverRegistered = false;
+        }
+        if (dndReceiverRegistered) {
+            unregisterReceiver(dndEvents);
+            dndReceiverRegistered = false;
+        }
+        try { getContentResolver().unregisterContentObserver(zenMode); } catch (RuntimeException ignored) { }
+        requestStop();
+        calls.close();
+        weatherSync.close();
+        healthReplay.close();
+        coordinator.execute(() -> {
+            if (historySync != null) {
+                historySync.close();
+                historySync = null;
+            }
+        });
+        coordinator.shutdown();
+        worker.shutdownNow();
+        super.onDestroy();
+        destroyed.countDown();
+    }
+}

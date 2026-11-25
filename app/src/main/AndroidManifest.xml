@@ -1,0 +1,122 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <permission android:name="io.github.miam1ku.mibandoplusbridge.permission.FIND_PHONE"
+        android:protectionLevel="signature" />
+    <uses-permission android:name="io.github.miam1ku.mibandoplusbridge.permission.FIND_PHONE" />
+    <permission android:name="io.github.miam1ku.mibandoplusbridge.permission.SET_DND"
+        android:protectionLevel="signature" />
+    <uses-permission android:name="io.github.miam1ku.mibandoplusbridge.permission.SET_DND" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+    <uses-permission android:name="android.permission.ANSWER_PHONE_CALLS" />
+    <uses-permission android:name="android.permission.SEND_SMS" />
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.ACCESS_NOTIFICATION_POLICY" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <queries>
+        <package android:name="com.mi.health" />
+        <package android:name="com.heytap.mydevices" />
+        <package android:name="com.heytap.health" />
+        <package android:name="com.coloros.alarmclock" />
+        <package android:name="com.tencent.mobileqq" />
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+    <application android:name=".BridgeApplication" android:label="小米手环桥接"
+        android:description="@string/xposed_description" android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:theme="@style/Theme.OplusBand"
+        android:forceQueryable="true"
+        android:supportsRtl="true" android:usesCleartextTraffic="false">
+        <activity android:name=".MainActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE_PREFERENCES" />
+            </intent-filter>
+        </activity>
+        <activity android:name=".service.BandTileActivity" android:exported="false"
+            android:excludeFromRecents="true" android:noHistory="true"
+            android:theme="@style/Theme.OplusBand.Tile" />
+        <activity android:name=".DiagnosticActivity" android:exported="false" />
+        <activity android:name=".DeviceLogActivity" android:exported="false" />
+        <activity android:name=".LabActivity" android:exported="false" />
+
+        <activity android:name=".WeatherActivity" android:exported="false" />
+        <activity android:name=".integration.BandDetailsActivity" android:exported="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="com.oplus.mydevices.ACTION_DEVICE_DETAILED_PANEL" />
+                <action android:name="com.oplus.mydevices.ACTION_DEVICE_DETAILED_PAGE" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+        <service android:name=".service.BandLiveService" android:exported="false"
+            android:foregroundServiceType="connectedDevice" android:stopWithTask="false" />
+        <service android:name=".service.BandTileService" android:exported="true"
+            android:icon="@drawable/ic_qs_band" android:label="手环"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+            <meta-data android:name="android.service.quicksettings.TOGGLEABLE_TILE"
+                android:value="true" />
+        </service>
+        <service android:name=".notify.BandNotificationListener" android:exported="false"
+            android:enabled="false"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+        <receiver android:name=".service.BootReceiver" android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.USER_UNLOCKED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+        <provider android:name=".integration.DeviceCardProvider"
+            android:authorities="io.github.miam1ku.mibandoplusbridge.devices"
+            android:exported="true" android:grantUriPermissions="false">
+            <intent-filter>
+                <action android:name="oplus.devicecards.action.DEVICE_INFO" />
+            </intent-filter>
+            <meta-data android:name="oplus.devicecards.provider" android:resource="@xml/device_center" />
+        </provider>
+        <provider android:name=".integration.WeatherSnapshotProvider"
+            android:authorities="io.github.miam1ku.mibandoplusbridge.weather"
+            android:exported="true" android:grantUriPermissions="true" />
+        <provider android:name=".integration.HealthQueueProvider"
+            android:authorities="io.github.miam1ku.mibandoplusbridge.health"
+            android:exported="true" android:directBootAware="false"
+            android:grantUriPermissions="false" />
+        <provider android:name=".integration.CredentialProvider"
+            android:authorities="io.github.miam1ku.mibandoplusbridge.credentials"
+            android:exported="true" android:directBootAware="false"
+            android:grantUriPermissions="false" />
+        <provider android:name=".integration.HostNotifyProvider"
+            android:authorities="io.github.miam1ku.mibandoplusbridge.notify"
+            android:exported="true" android:directBootAware="false"
+            android:grantUriPermissions="false" />
+        <provider android:name=".integration.PhoneAlarmProvider"
+            android:authorities="io.github.miam1ku.mibandoplusbridge.phone-alarm"
+            android:exported="true" android:grantUriPermissions="false" />
+        <provider android:name="androidx.core.content.FileProvider"
+            android:authorities="io.github.miam1ku.mibandoplusbridge.debuglog"
+            android:exported="false" android:grantUriPermissions="true">
+            <meta-data android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/debug_log_paths" />
+        </provider>
+    </application>
+</manifest>

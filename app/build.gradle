@@ -1,0 +1,79 @@
+plugins {
+    id 'com.android.application'
+    id 'com.google.protobuf'
+}
+
+android {
+    namespace 'io.github.miam1ku.mibandoplusbridge'
+    compileSdk 36
+    buildToolsVersion '35.0.0'
+    defaultConfig {
+        applicationId 'io.github.miam1ku.mibandoplusbridge'
+        minSdk 36
+        targetSdk 36
+        versionCode 136
+        versionName '1.11.5+mihealth'
+        // LSPosed auto hot reload only fires when the installed versionCode changes.
+        // For a dev loop: ./gradlew :app:assembleDebug -PhotReloadVersionCode=<higher number>
+        if (project.hasProperty('hotReloadVersionCode')) {
+            versionCode project.property('hotReloadVersionCode') as int
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    buildFeatures { buildConfig true }
+    def keyPath = System.getenv('OPLUSBAND_KEYSTORE')
+    if (keyPath != null) {
+        signingConfigs {
+            projectKey {
+                storeFile file(keyPath)
+                storePassword System.getenv('OPLUSBAND_STORE_PASSWORD')
+                keyAlias System.getenv('OPLUSBAND_KEY_ALIAS')
+                keyPassword System.getenv('OPLUSBAND_KEY_PASSWORD')
+            }
+        }
+    }
+    buildTypes {
+        debug {
+            signingConfig keyPath != null ? signingConfigs.projectKey : null
+        }
+        release {
+            signingConfig keyPath != null ? signingConfigs.projectKey : null
+            minifyEnabled false
+        }
+    }
+}
+
+tasks.configureEach {
+    if (name == 'packageDebug' || name == 'packageRelease') {
+        doFirst {
+            ['OPLUSBAND_KEYSTORE', 'OPLUSBAND_STORE_PASSWORD', 'OPLUSBAND_KEY_ALIAS',
+             'OPLUSBAND_KEY_PASSWORD'].each {
+                if (!System.getenv(it)) throw new GradleException("Missing signing environment: ${it}")
+            }
+        }
+    }
+}
+
+protobuf {
+    protoc { artifact = 'com.google.protobuf:protoc:4.32.0' }
+    generateProtoTasks {
+        all().configureEach { task ->
+            task.builtins { java { option 'lite' } }
+        }
+    }
+}
+
+dependencies {
+    compileOnly 'io.github.libxposed:api:102.0.0'
+    implementation 'com.google.protobuf:protobuf-javalite:4.32.0'
+    implementation 'org.bouncycastle:bcprov-jdk18on:1.81'
+    implementation 'org.apache.commons:commons-compress:1.27.1'
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'com.google.android.material:material:1.14.0'
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'io.github.libxposed:api:102.0.0'
+    testImplementation 'org.json:json:20250517'
+}
