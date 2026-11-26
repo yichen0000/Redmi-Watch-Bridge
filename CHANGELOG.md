@@ -14,7 +14,15 @@
 
 - **OPPO 健康里手环当日步数一旦偏大，就再也改不回来，而且日志全绿**
   `OHealthStepWriter.covers()` 用「库里 ≥ 要写的值」判定「已覆盖」，所以偏大的值会被跳过；而宿主的两条退路都堵死了：`insertSportHealthData` 对同键行走 `processOldStat` 的 **max 合并**（写小值会被丢掉），表 1002 的 `delete` 又是空实现（`OHealthHealthImportHook` 里 1002/1010/1017 都继承 `SportDataStore.delete`，返回 0 且不删行）。与此同时，聚合审计的 `excessive` 判定只认 `device_unique_id` 为空的 `-2/-4` 聚合行，带设备号的手环行（`mode=-3`）永远进不了判定——这正是「日志一片 CONSISTENT、首页却是 5 倍」能同时成立的原因。
-  现在不再假装一致：手环行高于手环总量时记 `OHEALTH_STEP_STAT_ABOVE date= stored= expected=`，审计侧补一条 `OHEALTH_STEP_DEVICE_ABOVE`，首页缓存高于手环总量时记 `OHEALTH_STEP_CACHE_ABOVE`。**没有自动改数**——降值必须在宿主的合并里拦截，属另一项改动，宁可先看见也不静默编一个数。
+  现在不再假装一致：手环行高于手环总量时记 `OHEALTH_STEP_STAT_ABOVE date= stored= expected=`，审计侧补一条 `OHEALTH_STEP_DEVICE_ABOVE`，首页缓存高于手环总量时记 `OHEALTH_STEP_CACHE_ABOVE`。
+
+- **降值改不回来：合并钩子装错了进程**
+  上一条只让问题可见。真正要把数改小，只能在宿主的 `processOldStat` 合并里先把「库里那条」的步数改掉，再让宿主自己落库。第一版钩子装在了写数据的进程（主进程），实测 `applied=false`、读回仍是旧值。原因是进程归属：只有 `:SportDaemonService` 打开着 `databases/database.db`，主进程一个句柄都没有，`insertSportHealthData` 其实是对那个守护进程的请求——内存里的请求永远过不去。
+  现在请求以一个小文件放在宿主自己的 no-backup 目录（两个 Health 进程同 uid 同数据目录），写入侧布置、真正合并的那个进程消费，成功与否由**写入侧读回**判定，不用它看不见的标志位。没被消费的请求原样留在库里并被报成 `LOWER_UNCONFIRMED`，不会伪装成已修好。只改「步数 + 同步状态」两个字段，其余字段交给宿主原有的 max 合并，因此手机自己的行和 `-2/-4` 聚合行都不碰。
+  实测：库里 6800、手环 6632 时，守护进程打出 `OHEALTH_STEP_STAT_LOWER_APPLIED was=6800 now=6632`，下一次导入读回 `stored=6632 expected=6632`。
+
+- **同日「导入没跑」和「导入跑了但没做事」在日志里长得一样**
+  三处早退（无账号、无手环快照、无可写日期）都是静默 return，所以排查时无法区分。现在分别记 `OHEALTH_STEP_SKIP reason=account|band|days`，导入汇总行补上本次覆盖的日期（`dates=`），并新增 `OHEALTH_STEP_STAT_STORED date= stored= expected=` 给出宿主此刻真正持有的当日总数（按值去重，不刷屏）。
 
 - **OPPO 健康当日行被清空后不会自动补回**
   `writeStat()` 只在「这次要写的值」与上次写过的值不同时才读库核对；值没变就直接跳过。于是健康里清一次数据、当天的行没了，而记忆键还在，这一天就再也不会被写回去。
