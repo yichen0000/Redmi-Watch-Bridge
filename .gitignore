@@ -13,8 +13,9 @@ HANDOFF.md
 __pycache__/
 *.pyc
 tools/
-docs/ADAPT_PLAN.md
-docs/
+# Working notes stay local; the consistency plan is the one doc meant to be read on GitHub.
+docs/*
+!docs/CONSISTENCY_PLAN.md
 keystore-credentials.txt
 .env
 
