@@ -97,6 +97,10 @@ public final class MainActivity extends AppCompatActivity {
     private TextView todayNote;
     private boolean todayLoading;
     private long todayReadAtMs;
+    /** Shortest gap between two throttled reads of the today card. */
+    private static final long TODAY_MIN_INTERVAL_MS = 20_000L;
+    /** Re-reads the card once the throttle window has passed. */
+    private final Runnable todayTrailing = () -> refreshToday(true);
     private int todayColumns = 2;
     // data pipeline
     private TextView pipelineHeading;
@@ -675,6 +679,7 @@ public final class MainActivity extends AppCompatActivity {
         getContentResolver().unregisterContentObserver(observer);
         getContentResolver().unregisterContentObserver(deviceObserver);
         main.removeCallbacks(expireRefresh);
+        main.removeCallbacks(todayTrailing);
         worker.shutdown();
         super.onDestroy();
     }
@@ -1289,7 +1294,18 @@ public final class MainActivity extends AppCompatActivity {
      */
     private void refreshToday(boolean force) {
         if (todayGrid == null || todayLoading) return;
-        if (!force && System.currentTimeMillis() - todayReadAtMs < 20_000) return;
+        long since = System.currentTimeMillis() - todayReadAtMs;
+        if (!force && since < TODAY_MIN_INTERVAL_MS) {
+            // A sync round writes band-state several times inside a second and the last write is
+            // the one carrying the final total — so the update worth showing is exactly the one
+            // this window drops. Nothing else fires afterwards, so the card used to keep the older
+            // number until the next resume (measured 2026-11-26: card 5878 as of 19:01 while the
+            // state file already held 6564 as of 20:47). Re-read once the window has passed.
+            main.removeCallbacks(todayTrailing);
+            main.postDelayed(todayTrailing, TODAY_MIN_INTERVAL_MS - since);
+            return;
+        }
+        main.removeCallbacks(todayTrailing);
         todayLoading = true;
         worker.execute(() -> {
             TodaySummary summary = TodaySummary.read(this);
