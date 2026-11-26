@@ -851,7 +851,11 @@ public final class BandHistoryParser {
             // A report is a snapshot. Minutes recorded after it are absent from that total,
             // and a later partial report must not replace a larger minute sum.
             if (intervals && interval > daily) return new DailySteps(interval, intervalAt, true);
-            return new DailySteps(daily, dailyAt, true);
+            // The report's own timestamp is local midnight (decodeReport pins it there), which is
+            // useless as an "as of" time: keeping it makes the card claim the total was last seen
+            // at 00:00 while minute rows for the same day are hours newer. The newest minute row is
+            // the latest instant this total is known to hold, so it is the honest answer.
+            return new DailySteps(daily, Math.max(dailyAt, intervalAt), true);
         }
         return intervals ? new DailySteps(interval, intervalAt, false) : null;
     }

@@ -52,6 +52,13 @@ public final class MiHealthSync {
     private static final String KEY_AUTO = "auto-enabled";
     /** Heart rate, oxygen and breath are fetched per night; a week of them at once exceeds the store page limit. */
     private static final long NIGHT_PAD_MS = 60_000L;
+    /**
+     * How recently the band has to have written the night's last minute for the night to count as
+     * still open. The bridge syncs every half hour or so, so an open night's last row is minutes
+     * old while a closed one is hours old; 90 minutes separates the two without ever waiting a
+     * whole night for a late-morning wake-up.
+     */
+    private static final long OPEN_NIGHT_MS = 90 * 60_000L;
     /** One bucket per table, in report order. */
     private static final String SLEEP_LABEL = "睡眠";
 
@@ -227,7 +234,7 @@ public final class MiHealthSync {
         if (nights.isEmpty() && points.isEmpty()) return new Report("NO_RECORDS");
 
         // Peek first: data that is already there costs one file copy and nothing else.
-        Set<Integer> sleepDays;
+        Map<Integer, Long> sleepDays;
         Map<String, Set<Long>> minutes;
         try {
             MiHealthStore.copyOut(context, dir, accountDir, false);
@@ -239,10 +246,15 @@ public final class MiHealthSync {
 
         List<OHealthSleepPlan.Night> missingNights = new ArrayList<>();
         for (OHealthSleepPlan.Night night : nights) {
+            // A night the band has not closed yet. Its last minute row is the sync that just ran, so
+            // the night is still growing, and writing it now would put a half-night in Mi Health.
+            if (to - night.wakeMs() < OPEN_NIGHT_MS) continue;
             // Dedupe by sleep-day, not by wake time: the band rewrites the open sleep file on every
             // sync with a longer tail, so the same night arrives with a later wake time each time
-            // and a wake-time key would add the night again on every run.
-            if (!sleepDays.contains(OHealthSleepPlan.sleepDate(night.wakeMs(), zone))) {
+            // and a wake-time key would add the night again on every run. A stored row that ends
+            // earlier than this night is that same night caught mid-growth, so it is rewritten.
+            Long earliest = sleepDays.get(OHealthSleepPlan.sleepDate(night.wakeMs(), zone));
+            if (earliest == null || earliest < night.wakeMs() / 1000) {
                 missingNights.add(night);
             }
         }
@@ -344,7 +356,23 @@ public final class MiHealthSync {
                 for (OHealthSleepPlan.Night night : nights) {
                     List<HealthRecord> nightVitals = vitals(store, deviceId, night);
                     MiHealthSleepRecord.Row row = MiHealthSleepRecord.row(night, nightVitals, sid, zone);
-                    if (exists(db, MiHealthSleepRecord.TABLE, row.key(), sid, row.timeSeconds())) {
+                    long wakeSeconds = row.timeSeconds();
+                    // The primary key carries the wake time, so a night that grew is a different
+                    // row. Drop the shorter rows this bridge wrote for the same sleep-day first:
+                    // a night the band was still recording when it got written leaves one behind,
+                    // and it has to go (2026-11-26: Mi Health held 84 of 529 minutes because the
+                    // first write after sleep started was treated as final).
+                    int stale = db.delete("sleep_segment",
+                            "key=? AND sid=? AND time>=? AND time<? AND time<>?",
+                            new String[] {row.key(), sid, Long.toString(night.dayStartMs() / 1000),
+                                    Long.toString(night.dayEndMs() / 1000),
+                                    Long.toString(wakeSeconds)});
+                    if (stale > 0) {
+                        // Counted so a run that only replaced a night still installs its copy.
+                        written++;
+                        sleepRows++;
+                    }
+                    if (exists(db, MiHealthSleepRecord.TABLE, row.key(), sid, wakeSeconds)) {
                         continue;
                     }
                     db.execSQL("INSERT OR REPLACE INTO sleep_segment"
@@ -430,8 +458,8 @@ public final class MiHealthSync {
                 new Object[] {table});
     }
 
-    private static Set<Integer> existingSleepDays(File dir, String sid, ZoneId zone) {
-        Set<Integer> days = new HashSet<>();
+    private static Map<Integer, Long> existingSleepDays(File dir, String sid, ZoneId zone) {
+        Map<Integer, Long> days = new HashMap<>();
         SQLiteDatabase db = null;
         try {
             // Read-write on a private copy: a WAL database cannot be opened read-only without its
@@ -444,7 +472,10 @@ public final class MiHealthSync {
                     "SELECT time FROM sleep_segment WHERE key='sleep' AND sid=? AND isDeleted=0",
                     new String[] {sid})) {
                 while (cursor.moveToNext()) {
-                    days.add(OHealthSleepPlan.sleepDate(cursor.getLong(0) * 1000, zone));
+                    long wakeMs = cursor.getLong(0) * 1000;
+                    // The earliest row for each sleep-day: anything earlier than the night we are
+                    // about to write is a partial night that has to be replaced.
+                    days.merge(OHealthSleepPlan.sleepDate(wakeMs, zone), cursor.getLong(0), Math::min);
                 }
             }
         } catch (RuntimeException unreadable) {

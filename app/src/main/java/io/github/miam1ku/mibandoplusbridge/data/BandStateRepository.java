@@ -305,13 +305,19 @@ public final class BandStateRepository {
             boolean sameDay = previousAt > 0 && LocalDate.ofInstant(Instant.ofEpochMilli(previousAt), ZoneId.systemDefault())
                     .equals(LocalDate.ofInstant(Instant.ofEpochMilli(measuredAtMs), ZoneId.systemDefault()));
             if (measuredAtMs < previousAt && !(authoritative && sameDay)) return;
+            // The clock never moves backwards. A daily report is timestamped at local midnight but
+            // arrives after the minute rows it summarises, so the later of the two is the one the
+            // card should show.
+            long storedAt = Math.max(measuredAtMs, previousAt);
             // Steps only grow within a day. A daily report is a snapshot sampled when the band
             // wrote it, and its timestamp is pinned to local midnight (decodeReport), so a later
             // minute sum can already be higher than the report that arrives afterwards. Dropping the
             // total back to that smaller report would make the card and the band's own screen
             // disagree (measured 2026-11-25: card 3787, band 3917).
-            if (sameDay && previous >= stepsToday) return;
-            long storedAt = authoritative && previousAt > measuredAtMs ? previousAt : measuredAtMs;
+            if (sameDay && previous > stepsToday) return;
+            // An unchanged total is still a newer observation when the clock advanced. Without this
+            // the card kept saying "截至 12:56" for the rest of the day — the total had already been
+            // confirmed from newer minute rows, but the stored time stayed at the last change.
             if (previous == stepsToday && storedAt == previousAt) return;
             if (!state.edit().putLong("stepsToday", stepsToday).putLong("stepsAtMs", storedAt)
                     .remove("sportAtMs").putLong("revision", state.getLong("revision", 0) + 1).commit()) {

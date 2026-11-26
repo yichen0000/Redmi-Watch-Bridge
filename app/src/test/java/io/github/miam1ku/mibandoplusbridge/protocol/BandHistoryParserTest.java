@@ -187,7 +187,9 @@ public final class BandHistoryParserTest {
         withReport.add(step("steps_day", day, day + 86_400_000L, 20));
         var daily = BandHistoryParser.todaySteps(withReport, day, day + 86_400_000L);
         assertEquals(20, daily.steps);
-        assertEquals(day, daily.measuredAtMs);
+        // The report itself is timestamped at midnight; the newest minute row is the last instant
+        // this total is known to hold, so it is what the card shows as "as of".
+        assertEquals(day + 60_000L, daily.measuredAtMs);
         assertTrue(daily.authoritative);
         var later = new java.util.ArrayList<>(withReport);
         later.add(step("steps_interval", day + 120_000L, day + 180_000L, 25));
