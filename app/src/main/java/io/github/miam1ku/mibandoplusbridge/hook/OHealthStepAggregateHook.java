@@ -55,6 +55,10 @@ final class OHealthStepAggregateHook {
     private OHealthStepAggregateHook(Context context, ClassLoader loader) throws Exception {
         this.context = attachedContext(context, context.getApplicationContext());
         nativeAccess = new NativeAccess(loader);
+        // This is the process that opens databases/database.db, so it is also the one that runs
+        // the day-row merge an insert from the main process ends in. The correction request can
+        // only be honoured here.
+        OHealthStepLowering.install(loader, OHealthStepLowering.requestFile(this.context));
         HandlerThread thread = HookRuntime.thread("OplusBandStepAudit");
         worker = new Handler(thread.getLooper());
         XposedBridge.hookMethod(nativeAccess.merge, new XC_MethodHook() {

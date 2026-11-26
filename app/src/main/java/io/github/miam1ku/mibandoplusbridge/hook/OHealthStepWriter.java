@@ -47,6 +47,13 @@ final class OHealthStepWriter {
     static final int MAX_MINUTE_DISTANCE = 1_050;
     private static final String[] COLUMNS = {"recordId", "revision", "record"};
     private final OHealthHealthImportHook.HostContract host;
+    /**
+     * The file that carries one correction to the process that performs the merge. Null when the
+     * writer was built without one, in which case a day row above the band total is only reported.
+     */
+    private final java.io.File loweringChannel;
+    private String lastSkip;
+    private final java.util.Map<Integer, String> lastStored = new java.util.HashMap<>();
     private final Class<?> statClass;
     private final Constructor<?> statNew;
     private final Method setAccount, setDevice, setDate, setMode, setSteps, setTimezone;
@@ -59,8 +66,10 @@ final class OHealthStepWriter {
     private Method detailDistance, detailWorkout, detailMode, detailDisplay, detailType, detailZone;
     private Method detailGetStart, detailGetSteps, detailGetDevice;
 
-    OHealthStepWriter(OHealthHealthImportHook.HostContract host) throws ReflectiveOperationException {
+    OHealthStepWriter(OHealthHealthImportHook.HostContract host, java.io.File loweringChannel)
+            throws ReflectiveOperationException {
         this.host = host;
+        this.loweringChannel = loweringChannel;
         statClass = Class.forName("com.heytap.databaseengine.model.SportDataStat", false, host.loader);
         statNew = statClass.getConstructor();
         setAccount = statClass.getMethod("setSsoid", String.class);
@@ -84,11 +93,17 @@ final class OHealthStepWriter {
 
     void write(Context context) throws Exception {
         String account = host.account();
-        if (account == null || account.isBlank()) return;
+        if (account == null || account.isBlank()) {
+            skip("account");
+            return;
+        }
         Object api = host.api();
         if (api == null) throw new IllegalStateException("STEP_IMPORT_NOT_READY");
         Bundle band = OHealthDeviceHook.registeredSnapshot();
-        if (band == null || band.getString("deviceId", "").isBlank()) return;
+        if (band == null || band.getString("deviceId", "").isBlank()) {
+            skip("band");
+            return;
+        }
         String queued = band.getString("deviceId");
         String device = OHealthDeviceHook.healthId(queued);
         String category = deviceCategory(band.getString("modelId", ""));
@@ -97,7 +112,10 @@ final class OHealthStepWriter {
                 BandHistoryParser.stepDays(records), band.getLong("stepsToday", -1),
                 band.getLong("stepsAtMs", 0), java.time.ZoneId.systemDefault()));
         days.removeIf(day -> day.steps <= 0 && day.calories < 0 && day.moveAbout < 0 && day.distance < 0);
-        if (days.isEmpty()) return;
+        if (days.isEmpty()) {
+            skip("days");
+            return;
+        }
         SharedPreferences written = context.getSharedPreferences("oplusband-step-import", Context.MODE_PRIVATE);
         int inserted = 0;
         int skipped = 0;
@@ -123,7 +141,7 @@ final class OHealthStepWriter {
         scheduleAggregateAudits(context, account, queued, device, category, days);
         publishToday(context, days);
         publishSnapshot(context);
-        String summary = "OHEALTH_STEP_IMPORT days=" + days.size()
+        String summary = "OHEALTH_STEP_IMPORT days=" + days.size() + " dates=" + dates(days)
                 + " inserted=" + inserted + " skipped=" + skipped + " chart=" + chart;
         HookRuntime.log(summary);
         XposedBridge.log("OplusBandBridge " + summary);
@@ -193,19 +211,48 @@ final class OHealthStepWriter {
         } else {
             // A day row bigger than the band's own total is not covered up by rewriting it: the
             // host merge only ever keeps the maximum, so the write would be discarded and the
-            // log would claim success. Report it instead of pretending it is consistent.
+            // log would claim success. Report it, then lower it through the merge seam.
             long stored = storedSteps(existing, device, day.date, DAY_STEP_MODE);
+            noteStored(day, stored);
             if (stored > day.steps) {
                 String above = "OHEALTH_STEP_STAT_ABOVE date=" + day.date + " stored=" + stored
                         + " expected=" + day.steps;
                 HookRuntime.log(above);
                 XposedBridge.log("OplusBandBridge " + above);
+                lowerDayRow(api, account, device, day, stored);
             }
         }
         if (changed && !written.edit().putString(memory, key).commit()) {
             throw new IllegalStateException("STEP_IMPORT_MEMORY_FAILED");
         }
         return changed || !covered;
+    }
+
+    /** The days one pass covered, so "today was skipped" and "today was never in the list" differ. */
+    private static String dates(List<BandHistoryParser.StepDay> days) {
+        StringBuilder text = new StringBuilder();
+        for (BandHistoryParser.StepDay day : days) {
+            if (text.length() > 0) text.append(',');
+            text.append(day.date);
+        }
+        return text.toString();
+    }
+
+    /**
+     * Names the total Health actually holds for a day, once per distinct value.
+     *
+     * <p>The import log only says "skipped", which reads the same whether the row already matches
+     * the band or the host quietly kept a bigger one. Without this line the two are impossible to
+     * tell apart from the log alone.
+     */
+    private void noteStored(BandHistoryParser.StepDay day, long stored) {
+        String value = stored + ":" + day.steps;
+        if (value.equals(lastStored.get(day.date))) return;
+        lastStored.put(day.date, value);
+        String line = "OHEALTH_STEP_STAT_STORED date=" + day.date + " stored=" + stored
+                + " expected=" + day.steps;
+        HookRuntime.log(line);
+        XposedBridge.log("OplusBandBridge " + line);
     }
 
     /** Highest day total already stored for this device and mode; -1 when the day has no row. */
@@ -220,6 +267,59 @@ final class OHealthStepWriter {
             found = Math.max(found, (Integer) getSteps.invoke(row));
         }
         return found;
+    }
+
+    /**
+     * A pass that writes nothing used to leave no trace at all, so "the import did not run" and
+     * "the import ran and found nothing to do" looked identical. Name the missing input instead,
+     * once per distinct reason.
+     */
+    private void skip(String reason) {
+        if (reason.equals(lastSkip)) return;
+        lastSkip = reason;
+        String line = "OHEALTH_STEP_SKIP reason=" + reason;
+        HookRuntime.log(line);
+        XposedBridge.log("OplusBandBridge " + line);
+    }
+
+    /**
+     * Replaces a day row that holds more than the band's own total with that total.
+     *
+     * <p>An insert alone cannot do it: the host merges the stored row with the incoming one and
+     * keeps the maximum, so the smaller row loses while the store still reports success.
+     * {@link OHealthStepLowering} rewrites the stored entity inside that merge, which is the only
+     * seam where the number can move down - and it only exists in the process that owns the
+     * database, so the request travels as a file rather than as a field either side can read.
+     *
+     * <p>The read-back decides the outcome. A merge that never saw the request leaves the row as it
+     * was, and that is reported rather than counted as fixed.
+     */
+    private void lowerDayRow(Object api, String account, String device, BandHistoryParser.StepDay day,
+            long stored) throws Exception {
+        if (day.steps <= 0 || stored > Integer.MAX_VALUE) return;
+        if (!OHealthStepLowering.arm(loweringChannel, account, device, day.date, DAY_STEP_MODE,
+                (int) stored, (int) day.steps)) {
+            String line = "OHEALTH_STEP_STAT_LOWER_UNAVAILABLE date=" + day.date + " was=" + stored
+                    + " expected=" + day.steps;
+            HookRuntime.log(line);
+            XposedBridge.log("OplusBandBridge " + line);
+            return;
+        }
+        long now;
+        try {
+            host.insertRows(api, TABLE_STAT, List.of(statRow(account, device, day, DAY_STEP_MODE)));
+            List<?> after = host.readStepDays(api, account, day.startMs, day.startMs + 86_400_000L,
+                    DAY_STEP_MODE);
+            now = storedSteps(after, device, day.date, DAY_STEP_MODE);
+        } finally {
+            OHealthStepLowering.clear(loweringChannel);
+        }
+        String line = now == day.steps
+                ? "OHEALTH_STEP_STAT_LOWERED date=" + day.date + " was=" + stored + " now=" + now
+                : "OHEALTH_STEP_STAT_LOWER_UNCONFIRMED date=" + day.date + " was=" + stored
+                        + " now=" + now;
+        HookRuntime.log(line);
+        XposedBridge.log("OplusBandBridge " + line);
     }
 
     private Object statRow(String account, String device, BandHistoryParser.StepDay day, int mode)

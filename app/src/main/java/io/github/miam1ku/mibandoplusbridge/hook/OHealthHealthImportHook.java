@@ -96,7 +96,7 @@ public final class OHealthHealthImportHook {
         }
         OHealthStepWriter stepWriter = null;
         try {
-            stepWriter = new OHealthStepWriter(contract);
+            stepWriter = new OHealthStepWriter(contract, OHealthStepLowering.requestFile(context));
         } catch (ReflectiveOperationException | LinkageError unsupported) {
             HookRuntime.log("OHEALTH_STEP_CONTRACT_UNAVAILABLE");
         }
