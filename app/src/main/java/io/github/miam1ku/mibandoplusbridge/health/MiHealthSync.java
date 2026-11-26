@@ -50,6 +50,8 @@ public final class MiHealthSync {
     private static final String KEY_LAST_TEXT = "last-text";
     private static final String KEY_LAST_AT = "last-at";
     private static final String KEY_AUTO = "auto-enabled";
+    /** One-shot: the {@code timeIn0Tz} sign repair below runs until it has completed once. */
+    private static final String KEY_TZ_REPAIRED = "tz-offset-repaired";
     /** Heart rate, oxygen and breath are fetched per night; a week of them at once exceeds the store page limit. */
     private static final long NIGHT_PAD_MS = 60_000L;
     /**
@@ -61,6 +63,13 @@ public final class MiHealthSync {
     private static final long OPEN_NIGHT_MS = 90 * 60_000L;
     /** One bucket per table, in report order. */
     private static final String SLEEP_LABEL = "睡眠";
+    /** Report bucket for rows whose {@code timeIn0Tz} had the wrong sign. */
+    private static final String TZ_LABEL = "时区修正";
+    /** Every table whose {@code timeIn0Tz} the bridge writes. */
+    private static final List<String> OFFSET_TABLES = List.of(MiHealthVitalsRecord.STEP_TABLE,
+            MiHealthVitalsRecord.CALORIE_TABLE, MiHealthVitalsRecord.HR_TABLE,
+            MiHealthVitalsRecord.SPO2_TABLE, MiHealthVitalsRecord.STRESS_TABLE,
+            MiHealthSleepRecord.TABLE);
 
     private MiHealthSync() {}
 
@@ -264,7 +273,7 @@ public final class MiHealthSync {
             if (present != null && present.contains(point.timeSeconds())) continue;
             missingPoints.computeIfAbsent(point.table(), ignored -> new ArrayList<>()).add(point);
         }
-        if (missingNights.isEmpty() && missingPoints.isEmpty()) {
+        if (missingNights.isEmpty() && missingPoints.isEmpty() && repaired(context)) {
             return new Report("NOTHING_TO_DO", 0, nights.size() + points.size(), "", Map.of());
         }
 
@@ -273,8 +282,10 @@ public final class MiHealthSync {
             // A write needs a consistent copy: the host has to be gone before the file is taken.
             MiHealthStore.copyOut(context, dir, accountDir, true);
             File database = new File(dir, MiHealthStore.DB);
+            boolean repair = !repaired(context);
             int written = write(store, database, zone, sid, deviceId, missingNights, missingPoints,
-                    byTable);
+                    byTable, repair, from / 1000, to / 1000 + 60);
+            if (repair) prefs(context).edit().putBoolean(KEY_TZ_REPAIRED, true).apply();
             if (written == 0) {
                 MiHealthStore.startHost(context);
                 return new Report("NOTHING_TO_DO", 0, nights.size() + points.size(), "", Map.of());
@@ -341,7 +352,8 @@ public final class MiHealthSync {
      */
     private static int write(HealthRecordStore store, File database, ZoneId zone, String sid,
             String deviceId, List<OHealthSleepPlan.Night> nights,
-            Map<String, List<MiHealthVitalsRecord.Point>> points, Map<String, Integer> byTable) {
+            Map<String, List<MiHealthVitalsRecord.Point>> points, Map<String, Integer> byTable,
+            boolean repairOffsets, long fromSeconds, long toSeconds) {
         SQLiteDatabase db = null;
         try {
             db = SQLiteDatabase.openDatabase(database.getAbsolutePath(), null,
@@ -352,6 +364,14 @@ public final class MiHealthSync {
                     .getTotalSeconds();
             db.beginTransaction();
             try {
+                if (repairOffsets) {
+                    // Repair before inserting so the rows written below are the only fresh ones.
+                    int fixed = repairUtcOffsets(db, sid, fromSeconds, toSeconds);
+                    if (fixed > 0) {
+                        byTable.put(TZ_LABEL, fixed);
+                        written += fixed;
+                    }
+                }
                 int sleepRows = 0;
                 for (OHealthSleepPlan.Night night : nights) {
                     List<HealthRecord> nightVitals = vitals(store, deviceId, night);
@@ -382,8 +402,8 @@ public final class MiHealthSync {
                             new Object[] {row.key(), row.sid(), row.timeSeconds(),
                                     row.complete() ? 1 : 0, row.value(), row.endTimeSeconds(),
                                     row.zoneOffsetSeconds(), row.zoneName(),
-                                    row.timeSeconds() - row.zoneOffsetSeconds(),
-                                    row.endTimeSeconds() - row.zoneOffsetSeconds(), 0, 0});
+                                    row.timeSeconds() + row.zoneOffsetSeconds(),
+                                    row.endTimeSeconds() + row.zoneOffsetSeconds(), 0, 0});
                     written++;
                     sleepRows++;
                 }
@@ -401,13 +421,16 @@ public final class MiHealthSync {
                     for (MiHealthVitalsRecord.Point point : rowsInTable) {
                         if (exists(db, table, point.key(), sid, point.timeSeconds())) continue;
                         long end = point.timeSeconds() + 60;
+                        // timeIn0Tz is time + offset, not time - offset: every row Mi Health writes
+                        // for itself adds the zone offset (see repairUtcOffsets for the measurement
+                        // that pinned this, and for what the opposite sign did to its day buckets).
                         db.execSQL("INSERT OR REPLACE INTO " + table
                                         + " (key, sid, time, value, endTime, zoneOffsetInSec,"
                                         + " zoneName, timeIn0Tz, endTimeIn0Tz, isUpload, isDeleted)"
                                         + " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                                 new Object[] {point.key(), sid, point.timeSeconds(), point.value(),
                                         end, offset, zone.getId(),
-                                        point.timeSeconds() - offset, end - offset, 0, 0});
+                                        point.timeSeconds() + offset, end + offset, 0, 0});
                         written++;
                         rows++;
                     }
@@ -558,6 +581,64 @@ public final class MiHealthSync {
             if (!model.isEmpty() && model.equals(detail.model)) return detail.did;
         }
         throw new MiHealthStore.Failure("DEVICE_MISMATCH");
+    }
+
+    /**
+     * Rewrites the UTC-0 columns to the convention Mi Health uses for the rows it writes itself.
+     *
+     * <p>Native rows store {@code timeIn0Tz = time + zoneOffsetInSec} — verified on a
+     * {@code single_heart_rate} row Mi Health wrote on 2026-11-21 and on every native
+     * {@code sleep_segment} row. This bridge wrote {@code time - zoneOffsetInSec} until
+     * 2026-11-26. Mi Health decides which day a detail row belongs to from that column, so the
+     * wrong sign slid its day boundary eight hours late: everything before 16:00 local counted
+     * toward the previous day, and the home page only ever showed the afternoon. Measured
+     * 2026-11-26 19:55: the page read 2388 steps while {@code step_record} held 6552, and the 2388
+     * was exactly the rows from 16:00 onward.
+     *
+     * <p>Rows Mi Health wrote carry {@code +offset} and never match the WHERE clause, which is
+     * also what makes the repair idempotent: after one pass there is nothing left to fix.
+     */
+    private static int repairUtcOffsets(SQLiteDatabase db, String sid, long fromSeconds,
+            long toSeconds) {
+        String where = "sid=? AND zoneOffsetInSec>0 AND timeIn0Tz = time - zoneOffsetInSec";
+        String[] args = {sid};
+        String update = "UPDATE %s SET timeIn0Tz = time + zoneOffsetInSec,"
+                + " endTimeIn0Tz = endTime + zoneOffsetInSec WHERE " + where;
+        int touched = 0;
+        for (String table : OFFSET_TABLES) {
+            long found = 0;
+            try (Cursor cursor = db.rawQuery("SELECT count(*) FROM " + table + " WHERE " + where,
+                    args)) {
+                if (cursor.moveToFirst()) found = cursor.getLong(0);
+            }
+            if (found > 0) {
+                db.execSQL(String.format(java.util.Locale.ROOT, update, table), args);
+                touched += (int) found;
+            }
+            // Mi Health's update trigger only fires when isDeleted changes, so a row whose day moved
+            // tells it nothing. Push the days this sync covers through its own work queue instead —
+            // that queue is exactly what the insert trigger fills, so this is its normal input.
+            long queued = 0;
+            try (Cursor cursor = db.rawQuery("SELECT count(*) FROM " + table
+                    + " WHERE sid=? AND time>=? AND time<?",
+                    new String[] {sid, Long.toString(fromSeconds), Long.toString(toSeconds)})) {
+                if (cursor.moveToFirst()) queued = cursor.getLong(0);
+            }
+            if (queued > 0) {
+                db.execSQL("INSERT INTO _draft_" + table
+                                + " (key,sid,time,timeIn0Tz,isDeleted)"
+                                + " SELECT key,sid,time,timeIn0Tz,isDeleted FROM " + table
+                                + " WHERE sid=? AND time>=? AND time<?",
+                        new Object[] {sid, fromSeconds, toSeconds});
+                touched += (int) queued;
+            }
+        }
+        return touched;
+    }
+
+    /** True once the one-shot {@code timeIn0Tz} repair has completed. */
+    private static boolean repaired(Context context) {
+        return prefs(context).getBoolean(KEY_TZ_REPAIRED, false);
     }
 
     private static void deleteFiles(File dir) {
