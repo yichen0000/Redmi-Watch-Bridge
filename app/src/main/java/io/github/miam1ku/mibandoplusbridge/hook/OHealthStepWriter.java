@@ -171,26 +171,55 @@ final class OHealthStepWriter {
         String memory = "metric:" + device + ":" + day.date;
         String key = day.steps + ":" + day.calories + ":" + day.moveAbout + ":" + day.distance + ":milli";
         boolean changed = !key.equals(written.getString(memory, ""));
-        if (changed) {
-            long end = day.startMs + 86_400_000L;
-            List<?> existing = host.readStepDays(api, account, day.startMs, end, DAY_STEP_MODE);
-            if (!covers(existing, device, day, DAY_STEP_MODE)) {
-                host.insertRows(api, TABLE_STAT, List.of(statRow(account, device, day, DAY_STEP_MODE)));
-                List<?> confirmed = host.readStepDays(api, account, day.startMs, end, DAY_STEP_MODE);
-                if (!covers(confirmed, device, day, DAY_STEP_MODE)) {
-                    String miss = "OHEALTH_STEP_STAT_MISS date=" + day.date
-                            + " steps=" + day.steps + " cal=" + (day.calories * (long) CALORIE_SCALE)
-                            + " move=" + day.moveAbout + " " + summarize(confirmed);
-                    HookRuntime.log(miss);
-                    XposedBridge.log("OplusBandBridge " + miss);
-                    throw new IllegalStateException("STEP_STAT_UNCONFIRMED");
-                }
+        // The memory key records what this bridge last sent, never whether the row still exists.
+        // A data clear inside Health empties the table and leaves the key, and the day would then
+        // never be written again. Today is therefore re-checked on every pass; older days keep the
+        // cheap path, because a lost history row is rare and the aggregate audit reports it.
+        if (!changed && !isToday(day)) return false;
+        long end = day.startMs + 86_400_000L;
+        List<?> existing = host.readStepDays(api, account, day.startMs, end, DAY_STEP_MODE);
+        boolean covered = covers(existing, device, day, DAY_STEP_MODE);
+        if (!covered) {
+            host.insertRows(api, TABLE_STAT, List.of(statRow(account, device, day, DAY_STEP_MODE)));
+            List<?> confirmed = host.readStepDays(api, account, day.startMs, end, DAY_STEP_MODE);
+            if (!covers(confirmed, device, day, DAY_STEP_MODE)) {
+                String miss = "OHEALTH_STEP_STAT_MISS date=" + day.date
+                        + " steps=" + day.steps + " cal=" + (day.calories * (long) CALORIE_SCALE)
+                        + " move=" + day.moveAbout + " " + summarize(confirmed);
+                HookRuntime.log(miss);
+                XposedBridge.log("OplusBandBridge " + miss);
+                throw new IllegalStateException("STEP_STAT_UNCONFIRMED");
             }
-            if (!written.edit().putString(memory, key).commit()) {
-                throw new IllegalStateException("STEP_IMPORT_MEMORY_FAILED");
+        } else {
+            // A day row bigger than the band's own total is not covered up by rewriting it: the
+            // host merge only ever keeps the maximum, so the write would be discarded and the
+            // log would claim success. Report it instead of pretending it is consistent.
+            long stored = storedSteps(existing, device, day.date, DAY_STEP_MODE);
+            if (stored > day.steps) {
+                String above = "OHEALTH_STEP_STAT_ABOVE date=" + day.date + " stored=" + stored
+                        + " expected=" + day.steps;
+                HookRuntime.log(above);
+                XposedBridge.log("OplusBandBridge " + above);
             }
         }
-        return changed;
+        if (changed && !written.edit().putString(memory, key).commit()) {
+            throw new IllegalStateException("STEP_IMPORT_MEMORY_FAILED");
+        }
+        return changed || !covered;
+    }
+
+    /** Highest day total already stored for this device and mode; -1 when the day has no row. */
+    private long storedSteps(List<?> rows, String device, int date, int mode)
+            throws ReflectiveOperationException {
+        long found = -1;
+        for (Object row : rows) {
+            if (!statClass.isInstance(row)) continue;
+            if (date != (Integer) getDate.invoke(row)) continue;
+            if (!device.equals(getDevice.invoke(row))) continue;
+            if ((Integer) getMode.invoke(row) != mode) continue;
+            found = Math.max(found, (Integer) getSteps.invoke(row));
+        }
+        return found;
     }
 
     private Object statRow(String account, String device, BandHistoryParser.StepDay day, int mode)
@@ -477,7 +506,18 @@ final class OHealthStepWriter {
                     "com.heytap.health.core.provider.adapter.open.SportDataAdapter", false, host.loader);
             Object result = adapter.getMethod("querySportData", Context.class).invoke(null, context);
             if (!(result instanceof Bundle bundle)) throw new IllegalStateException("STEP_CACHE_BUNDLE");
-            if (!publishSteps(bundle.getLong("step"), steps)) return;
+            long shown = bundle.getLong("step");
+            if (!publishSteps(shown, steps)) {
+                // The card reads this cache, and it only ever rises. When it already holds more
+                // than the band's own total, the page will keep showing that number no matter
+                // what the tables say; name it so the two numbers can be traced to one source.
+                if (steps > 0 && shown > steps) {
+                    String above = "OHEALTH_STEP_CACHE_ABOVE cache=" + shown + " band=" + steps;
+                    HookRuntime.log(above);
+                    XposedBridge.log("OplusBandBridge " + above);
+                }
+                return;
+            }
             adapter.getMethod("updateSportData", Context.class, ContentValues.class)
                     .invoke(null, context, values);
         } catch (Throwable failure) {

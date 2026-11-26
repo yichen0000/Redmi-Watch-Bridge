@@ -196,4 +196,24 @@ public final class OHealthStepAggregateHookTest {
         token.applied = true;
         assertFalse(token.matchesValues("account", null, 20261101, -2, 91L, 11292));
     }
+
+    /** The band's own day row is device-scoped, so only this comparison can see it stuck high. */
+    @Test public void deviceDayRowAboveTheBandTotalIsReportedAndAnAgreeingRowIsSilent() {
+        var zone = java.time.ZoneId.of("Asia/Shanghai");
+        long start = java.time.LocalDate.of(2026, 11, 1).atStartOfDay(zone).toInstant().toEpochMilli();
+        List<Map<String, String>> rows = List.of(
+                row(1, null, -4, 11292), row(2, null, -2, 11292), row(3, "MAC", -3, 221));
+        // 221 stored against the band's own 221: nothing to report.
+        assertNull(OHealthStepAggregateHook.deviceAbove(rows,
+                new io.github.miam1ku.mibandoplusbridge.data.StepAggregateAuditStore.Request(
+                        "account", "MAC", "MAC", 20261101, start, "Asia/Shanghai", 221, 1)));
+        // The band says 120 for that day: the stored 221 is above it and must be named.
+        assertEquals("date=20261101 stored=221 expected=120", OHealthStepAggregateHook.deviceAbove(rows,
+                new io.github.miam1ku.mibandoplusbridge.data.StepAggregateAuditStore.Request(
+                        "account", "MAC", "MAC", 20261101, start, "Asia/Shanghai", 120, 1)));
+        // A row for another device, or another mode, is somebody else's business.
+        assertNull(OHealthStepAggregateHook.deviceAbove(rows,
+                new io.github.miam1ku.mibandoplusbridge.data.StepAggregateAuditStore.Request(
+                        "account", "OTHER", "OTHER", 20261101, start, "Asia/Shanghai", 120, 1)));
+    }
 }

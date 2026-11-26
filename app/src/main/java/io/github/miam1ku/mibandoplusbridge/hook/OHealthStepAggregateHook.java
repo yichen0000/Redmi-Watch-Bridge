@@ -145,11 +145,19 @@ final class OHealthStepAggregateHook {
 
     private void audit(Object process, Request request) throws Exception {
         Object db = nativeAccess.db.get(process);
+        List<Map<String, String>> dayRows;
         boolean excessive;
         synchronized (process) {
-            excessive = rows(db, request).stream().anyMatch(row -> aggregate(row)
+            dayRows = rows(db, request);
+            excessive = dayRows.stream().anyMatch(row -> aggregate(row)
                     && Long.parseLong(row.get("total_steps")) > request.daySteps());
         }
+        // The rows above are the deviceless aggregates only. The band's own day row carries its
+        // device id, so it never reaches that check: a bridge-written day row stuck above the
+        // band's total leaves every audit green while the home page shows the bigger number.
+        // Report it, and never feed it to the repair below - that path owns the aggregate rows.
+        String deviceAbove = deviceAbove(dayRows, request);
+        if (deviceAbove != null) log("OHEALTH_STEP_DEVICE_ABOVE " + deviceAbove);
         if (!excessive) {
             Bundle clear = new Bundle();
             clear.putString("request", request.toJson().toString());
@@ -249,6 +257,27 @@ final class OHealthStepAggregateHook {
     private static boolean aggregate(Map<String, String> row) {
         String mode = row.get("sport_mode");
         return empty(row.get("device_unique_id")) && ("-2".equals(mode) || "-4".equals(mode));
+    }
+
+    /**
+     * The band's own day row ({@code DAY_STEP_MODE}) when it holds more steps than the band's
+     * total for that day, as {@code "date=... stored=... expected=..."}; null when it agrees.
+     */
+    static String deviceAbove(List<Map<String, String>> rows, Request request) {
+        for (Map<String, String> row : rows) {
+            if (!request.nativeDevice().equals(row.get("device_unique_id"))) continue;
+            if (!Integer.toString(OHealthStepWriter.DAY_STEP_MODE).equals(row.get("sport_mode"))) continue;
+            try {
+                long stored = Long.parseLong(row.get("total_steps"));
+                if (stored > request.daySteps()) {
+                    return "date=" + request.date() + " stored=" + stored
+                            + " expected=" + request.daySteps();
+                }
+            } catch (NumberFormatException unreadable) {
+                // A row without a readable total cannot be compared; the next pass retries.
+            }
+        }
+        return null;
     }
 
     private StepAggregateReview assess(Object db, Request request, List<StepAggregateReview.SourceMinute> sources)

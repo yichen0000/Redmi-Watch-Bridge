@@ -36,6 +36,29 @@ OPPO 侧三个具体问题（都已核对代码）：
 
 ---
 
+## 1.5 实测基线（2026-11-26 21:20，`mode=NATIVE`）
+
+改之前先把四个数摆出来，避免拿猜测当需求：
+
+| 指标 | 手环 | `band-state` | OPPO 首页 | 小米健康 `daily_report` |
+| --- | --- | --- | --- | --- |
+| 步数 | 6632 | 6632 | **6632** | 6552 |
+| 心率 | 82 @20:50 | 82 | 82 @20:50 | 20:05 截止 |
+| 血氧 | 99 | — | 99 @20:50 | 97 @20:00 |
+| 压力 | — | — | 35 @20:20 | — |
+| 睡眠 | 8:49（529 分） | — | **8:37（517 分）** | **517 分** |
+
+两条差异都**不是错**，都不该"对齐"：
+
+1. 小米健康差 80 步 = 21:03 补写的 4 分钟（33+1+34+12）。它停用中，`daily_report` 停在 20:05，这 4 条在 `_draft_*` 队列里等它下次启动汇总。手写 `daily_report` 才是造假：它自己的聚合器一启动就会覆盖，中间那段时间用户看到的是编的数。
+2. 睡眠差 12 分钟：两个 App 都是 517，手环写 529 = 517 + `sleep_awake_duration=12`。**手环把夜间清醒算进"睡眠时长"，App 只算睡着的时间。** 把 529 灌进 OPPO 等于把醒着的时间记成睡眠。
+
+顺带验证：小米健康 `daily_report.timeInZero = 1795651200`（本地 11-26 08:00 = 当天 UTC 零点），正是 `timeIn0Tz = time + 28800` 再按 UTC 日取整的结果，反向印证了 §1 的符号修正。
+
+**结论**：OPPO 侧不需要"改数字"，需要的是**看见**——见 §2 P1′。
+
+---
+
 ## 2. 改造方案（按优先级，P0 必须做）
 
 ### P0 · 单一真值来源
@@ -49,15 +72,44 @@ OPPO 侧三个具体问题（都已核对代码）：
 
 **风险**：低。`band-state` 已有单调与时间戳规则。
 
-### P1 · OPPO 健康：可纠正 + 日界对齐
+### P1 · OPPO 健康：先能看见，再谈纠正
 
-1. `covers()` 改成「同日 / 同设备 / 同 mode 时，以手环值为准覆盖写」，而不是 `>=` 判等跳过。
-   - 覆盖写只对新数据（`isUpload=0`）生效；已上传的行不碰。
-   - 需要一个「本次写入值 < 库中值」的日志计数，用于确认确实发生了纠正。
-2. 首页 provider（`self/sport`）与表 1002 在**同一次** hook 内、用同一个 `day.steps` 写，避免缓存与表不一致。
-3. 日界：确认 `StepDay.date` 与 OPPO 的日键同为本地日历日；若 OPPO 用别的基准（如 UTC），在 `stepDays()` 出口统一换算，不要在 writer 里各写各的。
+原方案（把 `covers()` 的 `>=` 改成「以手环值为准覆盖写」）**做不到**，已核对：
 
-**风险**：中。允许数值下降会让「历史某天变小」可见，必须只在 `isUpload=0` 上做，且先在一台机器上跑一天对比。
+- `insertSportHealthData` → 宿主 `processOldStat(old,new)` 是 **max 合并**（`OHealthStepAggregateHook:67-68` 的注释），写一条更小的值会被丢掉，`covers()` 反而会"确认成功"。
+- 表 1002 的 `delete` 是**空实现**：1002/1010/1017 都继承 `SportDataStore.delete`，返回 0 且不删行（`OHealthHealthImportHook:1150-1154` 的注释），所以不能"先删后插"。
+- 唯一能改小的地方是宿主的合并钩子（`processOldStat` / `getStat`），它的 `Mutation` 机制目前只为 `-2/-4` 聚合行开放，且要绑一份 `StepAggregateReview` + 人工 approve（`OHealthStepAggregateHook:204-227`，`StepAggregateAuditStore:190-208`）。
+
+**所以 P1 拆成两步，第一步已落地（`abcee92` 之后）：**
+
+**P1′（已做）· 让"偏大"不再沉默**
+
+| 位置 | 新增 | 含义 |
+| --- | --- | --- |
+| `OHealthStepWriter.writeStat` | `OHEALTH_STEP_STAT_ABOVE date= stored= expected=` | 手环设备行（`mode=-3`）步数高于手环当日总量 |
+| `OHealthStepAggregateHook.audit` | `OHEALTH_STEP_DEVICE_ABOVE date= stored= expected=` | 补上审计盲区：此前只认空 device 的 `-2/-4` 行，带设备号的行永远判不到 |
+| `OHealthStepWriter.updateSportCache` | `OHEALTH_STEP_CACHE_ABOVE cache= band=` | 首页读的缓存高于手环总量 |
+
+三条都只记日志、**不改数值**。理由：在还没出现过的场景上贸然降值，等于用一次写操作替换一个数字，而"哪个才是真的"没有证据。
+
+同一轮还修了一个会**丢数据**的缺陷：`writeStat` 原先只在「要写的值变了」时才读库，值没变就跳过；健康里清一次数据后当天行没了、记忆键还在，这一天就再也不会被写回。现在当天每次同步都核对行是否还在。
+
+**P1″（未做）· 真正允许降值**
+
+前置条件：把 `Mutation` 的适用范围扩到「设备行 + `mode=-3` + 本桥接 deviceId」，在合并时把 old 实体的 `total_steps` 换成手环值，并沿用现有 `verifyPreserved()` 的逐列校验（只允许 steps/sync/时间戳类字段变化）。
+触发条件必须**可证伪**，不能是"想让它相等"：
+
+1. 该日已闭合（`date < 今天`），手环日报已定稿；
+2. 库里的值 **不等于**本桥接 `metric:<device>:<date>` 里记的值（说明不是我们写的），或库里值 > 该日我们写过任何值的最大值；
+3. 变化后要能读回校验。
+
+**风险**：中高。`Mutation` 目前只在 `:SportDaemonService` 进程安装，writer 在主进程，跨进程要复用现有的 `HealthQueueProvider` 队列；做之前先在测试机造一次"故意写偏大"复现，能稳定修回来再上。
+
+### P1-old（作废，留档）
+
+1. ~~`covers()` 改成「同日 / 同设备 / 同 mode 时，以手环值为准覆盖写」~~ → 被宿主 max 合并吃掉，无效。
+2. ~~首页 provider 与表 1002 在同一次 hook 内用同一个 `day.steps` 写~~ → 已如此（`publishToday`），无需改；但 `SportDataAdapter` 在主进程 `ClassNotFoundException`（见 21:27 日志），缓存这条路径实际没生效，首页显示的数来自表 1002 的聚合。
+3. 日界：`StepDay.date` 与 OPPO 日键同为本地日历日，已核对无误。
 
 ### P2 · 小米健康：停用状态下也能补写
 
@@ -114,9 +166,10 @@ NATIVE 模式下唯一真实的差别：MH 被停用期间不会自己跑聚合�
 
 ---
 
-## 5. 建议执行顺序
+## 5. 执行顺序
 
-1. P0（半天）—— 只动 `OHealthStepWriter` 的真值入口，不动写库策略，先让链路只有一个数。
-2. ~~P2-B（1 小时）—— 纯文案与状态机，无风险。~~ 已实测通过，无需改动。
-3. P3-3（半天）—— 加对账日志，为 P1 提供观察手段。
-4. P1（1~2 天）—— 覆盖写 + provider 同步，改完用第 3 节的四条验收。
+1. ~~P2-B（1 小时）—— 纯文案与状态机。~~ 已实测通过，无需改动。
+2. **P1′（已做）**——三条"偏大"日志 + 当天行自愈（`OHealthStepWriter` / `OHealthStepAggregateHook`）。
+3. P3-3（半天）—— 每轮同步记一行 `CONSISTENCY band=X oppo=Y mh=Z`，把 P1′ 的三条日志汇总成一句。
+4. P0（半天）—— 真值入口收敛；实测下来 OPPO 侧已经只吃 `preferLiveTotal` 之后的值，收益主要是去掉 `publishSnapshot` 里那条与 `publishToday` 重复的路径。
+5. **P1″（1~2 天，按需）**—— 拦截宿主合并、允许设备行降值。前提是先复现一次"故意写偏大"，否则不动。
